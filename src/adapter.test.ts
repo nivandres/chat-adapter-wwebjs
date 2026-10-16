@@ -72,6 +72,7 @@ function fakeClient(overrides: Record<string, unknown> = {}) {
     getNumberId: vi.fn(async () => null),
     getPinnedMessages: vi.fn(async () => []),
     getProfilePicUrl: vi.fn(async () => "https://example.com/pic.jpg"),
+    getState: vi.fn(async () => "CONNECTED"),
     info: { pushname: "Bot", wid: { _serialized: BOT } },
     initialize: vi.fn(async () => undefined),
     searchMessages: vi.fn(async () => []),
@@ -1319,6 +1320,76 @@ describe("WWebJSAdapter", () => {
         await attempt;
 
         expect(client.destroy).toHaveBeenCalledTimes(2);
+      });
+
+      it("reports where the session stands, for health checks", async () => {
+        const { adapter, client } = await connected();
+        expect(adapter.connection).toBe("idle");
+
+        const attempt = adapter.connect();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(adapter.connection).toBe("connecting");
+        client.emit("ready");
+        await attempt;
+        expect(adapter.connection).toBe("connected");
+
+        client.emit("disconnected", "CONFLICT");
+        expect(adapter.connection).toBe("reconnecting");
+        client.emit("disconnected", "LOGOUT");
+        expect(adapter.connection).toBe("logged_out");
+
+        await adapter.disconnect();
+        expect(adapter.connection).toBe("closed");
+      });
+
+      it("abandons a connection that never becomes ready, closing its browser", async () => {
+        const { adapter, client } = await connected(
+          { connectTimeoutMs: 10_000, reconnect: false },
+          { initialize: vi.fn(() => new Promise(() => {})) },
+        );
+        const attempt = adapter.connect();
+        const outcome = expect(attempt).rejects.toThrow("not ready within 10000ms");
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        await outcome;
+        expect(client.destroy).toHaveBeenCalled();
+        expect(adapter.connection).toBe("disconnected");
+      });
+
+      it("reopens a session WhatsApp stopped answering, which no event reported", async () => {
+        const { adapter, client } = await connected({ watchdogIntervalMs: 30_000 });
+        const first = adapter.connect();
+        client.emit("ready");
+        await first;
+        client.getState.mockResolvedValue("UNPAIRED");
+
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(adapter.connection).toBe("connected");
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(adapter.connection).toBe("reconnecting");
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(client.initialize).toHaveBeenCalledTimes(2);
+      });
+
+      it("retries a first connection that failed, once the watchdog notices", async () => {
+        const { adapter, client } = await connected({ connectTimeoutMs: 1_000 });
+        client.initialize.mockImplementationOnce(() => new Promise(() => {}));
+        const attempt = adapter.connect().catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(1_000);
+        await attempt;
+        expect(adapter.connection).toBe("disconnected");
+
+        await vi.advanceTimersByTimeAsync(60_000 + 5_000);
+        expect(client.initialize).toHaveBeenCalledTimes(2);
+      });
+
+      it("never probes when the watchdog is off", async () => {
+        const { adapter, client } = await connected({ watchdogIntervalMs: false });
+        const first = adapter.connect();
+        client.emit("ready");
+        await first;
+        await vi.advanceTimersByTimeAsync(600_000);
+        expect(client.getState).not.toHaveBeenCalled();
       });
 
       it("never retries a logout, which needs a new pairing", async () => {

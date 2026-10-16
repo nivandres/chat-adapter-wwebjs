@@ -9,6 +9,7 @@ export type {
   WWebJSAckStatus,
   WWebJSAdapterConfig,
   WWebJSCallHandler,
+  WWebJSConnection,
   WWebJSGroupEvent,
   WWebJSGroupEventHandler,
   WWebJSGroupParticipant,

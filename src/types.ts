@@ -8,6 +8,13 @@ import type {
   PollVote,
 } from "whatsapp-web.js";
 
+/**
+ * Where the WhatsApp session stands. Only `connected` can send and receive;
+ * `logged_out` needs a new pairing, and `closed` follows `disconnect()`.
+ */
+export type WWebJSConnection =
+  "closed" | "connected" | "connecting" | "disconnected" | "idle" | "logged_out" | "reconnecting";
+
 /** Decoded thread ID components for WhatsApp. */
 export interface WWebJSThreadId {
   /** WhatsApp chat ID, e.g. `"15551234567@c.us"` or `"1234567890-1234@g.us"`. */
@@ -31,6 +38,13 @@ export interface WWebJSAdapterConfig {
 
   /** Options for the client the adapter constructs. Ignored when `client` is set. */
   clientOptions?: ClientOptions;
+
+  /**
+   * How long opening the session may take before it is abandoned — and, with
+   * `reconnect`, tried again. whatsapp-web.js itself never gives up. Defaults
+   * to 2 minutes.
+   */
+  connectTimeoutMs?: number;
 
   /** Logger instance. Replaced by the Chat SDK logger once initialized. */
   logger?: Logger;
@@ -78,6 +92,14 @@ export interface WWebJSAdapterConfig {
    * Defaults to `true`.
    */
   reconnect?: boolean;
+
+  /**
+   * How often a connected session is asked whether WhatsApp still answers.
+   * Two failed checks in a row count as a disconnect, which `reconnect` then
+   * handles. Catches a session that died without any event. Defaults to 1
+   * minute; `false` turns it off.
+   */
+  watchdogIntervalMs?: number | false;
 
   /** Bot display name. Defaults to `"wwebjs-bot"`. */
   userName?: string;

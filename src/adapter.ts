@@ -56,6 +56,7 @@ import type {
   WWebJSAckStatus,
   WWebJSAdapterConfig,
   WWebJSCallHandler,
+  WWebJSConnection,
   WWebJSGroupEvent,
   WWebJSGroupEventHandler,
   WWebJSGroupParticipant,
@@ -107,6 +108,8 @@ const MAX_HISTORY = 1000;
 const MAX_MENTION_LOOKUPS = 20;
 /** A contact or quoted message WhatsApp never returns must not hold the message back. */
 const LOOKUP_TIMEOUT_MS = 5_000;
+const CONNECT_TIMEOUT_MS = 120_000;
+const WATCHDOG_INTERVAL_MS = 60_000;
 const RECONNECT_MIN_MS = 5_000;
 const RECONNECT_MAX_MS = 300_000;
 const MAX_POLL_OPTIONS = 12;
@@ -139,6 +142,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   private _closed = false;
   private _retry?: ReturnType<typeof setTimeout>;
   private _initialized = false;
+  private _state: WWebJSConnection = "idle";
+  private _watchdog?: ReturnType<typeof setInterval>;
+  private _strikes = 0;
 
   constructor(config: WWebJSAdapterConfig = {}) {
     const name = config.adapterName ?? "wwebjs";
@@ -152,6 +158,11 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     this._logger = config.logger ?? new ConsoleLogger("info").child(name);
     this.client = config.client ?? new WAClient(this._clientOptions());
     this._listen();
+  }
+
+  /** Where the session stands; a health check reads `connection === "connected"`. */
+  get connection(): WWebJSConnection {
+    return this._state;
   }
 
   get botUserId(): string | undefined {
@@ -178,8 +189,11 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     }
     this._closed = false;
     clearTimeout(this._retry);
+    this._retry = undefined;
+    this._watch();
     this._connection ??= this._connect().catch((error: unknown) => {
       this._connection = null;
+      if (this._state !== "logged_out" && !this._closed) this._state = "disconnected";
       throw error;
     });
     return this._connection;
@@ -188,7 +202,10 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   /** Close the browser session. */
   async disconnect(): Promise<void> {
     this._closed = true;
+    this._state = "closed";
     clearTimeout(this._retry);
+    clearInterval(this._watchdog);
+    this._watchdog = undefined;
     this._connection = null;
     await this.client.destroy();
   }
@@ -623,6 +640,29 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   }
 
   private async _connect(): Promise<void> {
+    const timeoutMs = this._config.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(new ValidationError("wwebjs", `WhatsApp was not ready within ${timeoutMs}ms.`)),
+        timeoutMs,
+      );
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([this._open(), timedOut]);
+    } catch (error) {
+      // An abandoned attempt keeps its browser otherwise.
+      await this.client.destroy().catch(() => undefined);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async _open(): Promise<void> {
+    this._state = this._initialized ? "reconnecting" : "connecting";
     const ready = new Promise<void>((resolve, reject) => {
       const onReady = () => settle(resolve);
       const onFailure = (message: string) =>
@@ -656,6 +696,8 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     if (onPairingCode) this.client.on("code", (code) => void onPairingCode(code));
 
     this.client.on("ready", () => {
+      this._state = "connected";
+      this._strikes = 0;
       if (!this._config.userName && this.client.info?.pushname) {
         this.userName = this.client.info.pushname;
       }
@@ -910,7 +952,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   private _onDisconnected(reason: string): void {
     if (this._closed) return;
     this._connection = null;
+    this._state = this._config.reconnect === false ? "disconnected" : "reconnecting";
     if (reason === "LOGOUT") {
+      this._state = "logged_out";
       this._logger.error("WhatsApp logged this session out; pair it again to reconnect", {
         reason,
       });
@@ -923,13 +967,40 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   private _reconnect(delayMs: number): void {
     if (this._closed || this._config.reconnect === false) return;
     clearTimeout(this._retry);
+    this._state = "reconnecting";
     this._retry = setTimeout(() => {
+      this._retry = undefined;
       this.connect().catch((error: unknown) => {
         this._logger.warn("Reconnecting to WhatsApp failed", { error, delayMs });
         this._reconnect(Math.min(delayMs * 2, RECONNECT_MAX_MS));
       });
     }, delayMs);
     this._retry.unref?.();
+  }
+
+  private _watch(): void {
+    const everyMs = this._config.watchdogIntervalMs ?? WATCHDOG_INTERVAL_MS;
+    if (this._watchdog || everyMs === false) return;
+    this._watchdog = setInterval(() => this._guard("watchdog check", this._check()), everyMs);
+    this._watchdog.unref?.();
+  }
+
+  /** Revives a session that died without an event, or a first connection that failed. */
+  private async _check(): Promise<void> {
+    if (this._closed) return;
+    if (this._state === "disconnected" && !this._retry) {
+      this._reconnect(RECONNECT_MIN_MS);
+      return;
+    }
+    if (this._state !== "connected") return;
+    const state = await within(this.client.getState());
+    if (state === "CONNECTED") {
+      this._strikes = 0;
+      return;
+    }
+    if (++this._strikes < 2) return;
+    this._strikes = 0;
+    this._onDisconnected(`UNRESPONSIVE (${state ?? "no answer"})`);
   }
 
   private _render(message: AdapterPostableMessage): string {
@@ -982,7 +1053,10 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
   private _raw(sent: WAMessage | undefined, threadId: string): RawMessage<WAMessage> {
     if (!sent) {
-      throw new ValidationError("wwebjs", "WhatsApp did not return the sent message.");
+      throw new ValidationError(
+        "wwebjs",
+        "WhatsApp did not return the sent message. whatsapp-web.js 1.34.7 and older cannot read current WhatsApp Web; install github:pedroslopez/whatsapp-web.js#064a3d5.",
+      );
     }
     return { id: sent.id._serialized, raw: sent, threadId };
   }

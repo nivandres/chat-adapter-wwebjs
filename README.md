@@ -20,7 +20,7 @@ npm i chat-adapter-wwebjs whatsapp-web.js chat @chat-adapter/shared
 
 ESM only, Node >= 20. `chat`, `@chat-adapter/shared` and `whatsapp-web.js` are peers, so you control their versions. whatsapp-web.js downloads a Chromium build through Puppeteer on install.
 
-WhatsApp Web renamed the IDs whatsapp-web.js reads, and 1.34.7 cannot send or find chats since. Until a release carries the fix, install it from GitHub: `npm i github:pedroslopez/whatsapp-web.js#main`.
+WhatsApp Web renamed the IDs whatsapp-web.js reads, and 1.34.7 cannot send or find chats since. Until a release carries the fix, install the commit this adapter is tested against: `npm i github:pedroslopez/whatsapp-web.js#064a3d5`.
 
 ## Quick start
 
@@ -75,6 +75,7 @@ None. This adapter takes no credentials from the environment — a WhatsApp Web 
 | `adapterName`        | `string`                    | `"wwebjs"`      | Adapter identity and thread-ID prefix. Must match the key it is registered under in `Chat`, and must not contain `:`.                |
 | `client`             | `Client`                    | —               | An existing whatsapp-web.js client to drive. When omitted, one is built from `clientOptions`.                                        |
 | `clientOptions`      | `ClientOptions`             | `{}`            | Options for the client the adapter builds — `authStrategy`, `puppeteer`, `webVersionCache`, and so on. Ignored when `client` is set. |
+| `connectTimeoutMs`   | `number`                    | 2 minutes       | How long opening the session may take before it is abandoned and, with `reconnect`, tried again.                                     |
 | `logger`             | `Logger`                    | `ConsoleLogger` | Logger used until `Chat` hands over its own.                                                                                         |
 | `markSeen`           | `boolean`                   | `false`         | Send a read receipt for every inbound message as it arrives.                                                                         |
 | `maxMediaBytes`      | `number`                    | 64 MB           | Largest media read into memory, inbound or fetched from a `url`. Bytes are counted as they arrive, whatever size the sender claims.  |
@@ -83,6 +84,7 @@ None. This adapter takes no credentials from the environment — a WhatsApp Web 
 | `phoneNumber`        | `string`                    | —               | Log in with a pairing code instead of a QR. E.164 without the leading `+`.                                                           |
 | `receiveOwnMessages` | `boolean`                   | `false`         | Pass what the paired account did — its messages, edits, deletes and reactions — to the Chat SDK, which still skips most of its own.  |
 | `reconnect`          | `boolean`                   | `true`          | Open the session again when WhatsApp drops it, backing off from 5 seconds to 5 minutes. A logout is never retried.                   |
+| `watchdogIntervalMs` | `number \| false`           | 1 minute        | How often a connected session is asked whether WhatsApp still answers; two failed checks count as a disconnect.                      |
 | `userName`           | `string`                    | `"wwebjs-bot"`  | Bot display name. When unset, the account's WhatsApp push name is adopted once the session is ready.                                 |
 
 ## Platform setup
@@ -170,6 +172,7 @@ const bot = new Chat({ adapters: { sales, support }, state, userName: "my-bot" }
 - **`receiveOwnMessages` includes the adapter's own sends.** Turn it on only if your handlers can tell them apart.
 - **History is what the web client synced**, not WhatsApp's full server-side archive, and one read reaches back at most 1,000 messages.
 - **An attachment given only by `url` is fetched from the host's network**, with a 30-second timeout and `maxMediaBytes` as its limit. Never pass one an end user chose.
+- **`adapter.connection` tells where the session stands** — `connected`, `reconnecting`, `logged_out` and so on — for a health check, such as `chat-adapter-remote`'s `healthy: () => adapter.connection === "connected"`.
 - **Statuses, broadcast lists and WhatsApp's own notifications never reach your handlers.**
 - **`forwardMessage` and event call links fail on current WhatsApp Web.** whatsapp-web.js still calls modules WhatsApp has renamed; both return once it catches up. `sendEvent` without `callType` attaches no link and works.
 - **Messages received while the session was down are not replayed.** WhatsApp Web syncs them into history, where `fetchMessages` finds them, but no event fires for them.
