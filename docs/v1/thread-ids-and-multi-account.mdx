@@ -1,0 +1,74 @@
+---
+title: "Thread IDs and multi-account"
+description: "Running several WhatsApp numbers on one Chat instance."
+---
+
+## One prefix per account
+
+A thread ID is `{adapterName}:{chatId}`. The prefix defaults to `"wwebjs"`, it must match the key the adapter is registered under, and it is what keeps two accounts apart:
+
+```ts
+const sales = createWWebJSAdapter({
+  adapterName: "sales",
+  clientOptions: { authStrategy: new LocalAuth({ clientId: "sales" }) },
+});
+
+const support = createWWebJSAdapter({
+  adapterName: "support",
+  clientOptions: { authStrategy: new LocalAuth({ clientId: "support" }) },
+});
+
+const bot = new Chat({
+  adapters: { sales, support },
+  state: new MemoryStateAdapter(),
+  userName: "my-bot",
+});
+
+await bot.initialize();
+await Promise.all([sales.connect(), support.connect()]);
+```
+
+The same customer now has two distinct threads — `sales:15551234567@c.us` and `support:15551234567@c.us` — so subscriptions and per-thread state never leak between accounts.
+
+Each account also needs its own session directory. A shared `clientId` means two browsers fighting over one profile.
+
+<Callout type="warn">
+  `adapterName` must not contain `:`, since it is the thread-ID separator — the constructor throws
+  if it does — and it must equal the key in `adapters`, or `chat.thread(id)` cannot find the adapter
+  the ID belongs to.
+</Callout>
+
+## Decoding is scoped
+
+An adapter only decodes its own thread IDs:
+
+```ts
+sales.decodeThreadId("sales:15551234567@c.us"); // { chatId: "15551234567@c.us" }
+sales.decodeThreadId("support:15551234567@c.us"); // throws ValidationError
+```
+
+That is deliberate: it turns a cross-account mistake into an error at the call site instead of a message delivered from the wrong number.
+
+## Knowing which account you are in
+
+Inside a handler, `thread.adapter` is the one the message arrived on:
+
+```ts
+bot.onSubscribedMessage(async (thread, message) => {
+  const wa = requireWWebJSAdapter(thread);
+  await wa.sendPoll({ options: ["a", "b"], question: "?", threadId: thread.id });
+});
+```
+
+Because `requireWWebJSAdapter(thread)` resolves the adapter from the thread, extension calls always land on the account that received the message.
+
+## Opening a conversation
+
+`openDM` takes a phone number and resolves it through WhatsApp, which handles country-code variants that a naive `${number}@c.us` would get wrong:
+
+```ts
+const threadId = await sales.openDM("+1 (555) 123-4567");
+await sales.postMessage(threadId, "Your order shipped.");
+```
+
+Pass a chat ID and it is used as-is. If WhatsApp cannot resolve the number — it is not registered, or the session is offline — the adapter falls back to the plain form rather than throwing.

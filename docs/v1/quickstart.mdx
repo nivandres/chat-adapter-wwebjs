@@ -1,0 +1,89 @@
+---
+title: "Quickstart"
+description: "Link a WhatsApp account and answer your first message."
+---
+
+## Install
+
+```bash
+npm i chat-adapter-wwebjs whatsapp-web.js chat @chat-adapter/shared @chat-adapter/state-memory
+```
+
+ESM only, Node >= 20. `chat`, `@chat-adapter/shared` and `whatsapp-web.js` are peer dependencies, so you pick their versions. Installing whatsapp-web.js downloads a Chromium build through Puppeteer.
+
+## A bot that replies
+
+```ts title="bot.ts"
+import { MemoryStateAdapter } from "@chat-adapter/state-memory";
+import { Chat } from "chat";
+import { createWWebJSAdapter } from "chat-adapter-wwebjs";
+import qrcode from "qrcode-terminal";
+import { LocalAuth } from "whatsapp-web.js";
+
+const whatsapp = createWWebJSAdapter({
+  adapterName: "whatsapp",
+  clientOptions: { authStrategy: new LocalAuth({ dataPath: "./.wwebjs-auth" }) },
+  onQR: (qr) => qrcode.generate(qr, { small: true }),
+  userName: "my-bot",
+});
+
+const bot = new Chat({
+  adapters: { whatsapp },
+  state: new MemoryStateAdapter(),
+  userName: "my-bot",
+});
+
+bot.onNewMention(async (thread, message) => {
+  await thread.subscribe();
+  await thread.post(`Hello ${message.author.userName}!`);
+});
+
+bot.onSubscribedMessage(async (thread, message) => {
+  await thread.startTyping();
+  await thread.post({ markdown: `You said: _${message.text}_` });
+});
+
+await bot.initialize();
+await whatsapp.connect();
+```
+
+<Callout type="warn" title="Name it after its key">
+  `adapterName` must match the key the adapter is registered under in `Chat`. It is the thread-ID
+  prefix the SDK resolves threads by, so `adapters: {whatsapp}` needs `adapterName: "whatsapp"`.
+</Callout>
+
+<Callout type="warn" title="Order matters">
+  Register handlers and `await bot.initialize()` **before** `connect()`. Messages that arrive before
+  the SDK is initialized are dropped; the adapter logs a warning if you connect too early.
+</Callout>
+
+## Link the device
+
+Run it, then open WhatsApp on your phone → **Linked devices** → **Link a device**, and scan the QR printed by `onQR`.
+
+Prefer a code? Set `phoneNumber` in E.164 without the leading `+` and read it from `onPairingCode`:
+
+```ts
+const whatsapp = createWWebJSAdapter({
+  onPairingCode: (code) => console.log("Enter this in WhatsApp:", code),
+  phoneNumber: "15551234567",
+});
+```
+
+Then use **Link with phone number** on the same screen.
+
+## Keep the session
+
+`LocalAuth` writes the session to disk, so restarts skip the scan. Point `dataPath` at a volume that survives deploys, and give each account its own `clientId` when you run more than one.
+
+For a session you'd rather keep in a database, use whatsapp-web.js's `RemoteAuth` with your own store.
+
+## Shut down cleanly
+
+```ts
+process.on("SIGTERM", () => void whatsapp.disconnect());
+```
+
+`disconnect()` closes the browser. Without it a killed process can leave Chromium running.
+
+Next: [concepts](./concepts) explains how WhatsApp maps onto the Chat SDK's threads and channels.

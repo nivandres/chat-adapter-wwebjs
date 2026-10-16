@@ -1,0 +1,10 @@
+{
+  "title": "Chat Adapter for whatsapp-web.js",
+  "description": "Build WhatsApp bots with the Chat SDK using the whatsapp-web.js adapter.",
+  "git": {
+    "user": "nivandres",
+    "repo": "chat-adapter-wwebjs",
+    "branch": "main",
+    "path": "docs"
+  }
+}

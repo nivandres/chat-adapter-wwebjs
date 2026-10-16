@@ -1,0 +1,80 @@
+---
+title: "Formatting and media"
+description: "WhatsApp's markup, and how attachments move in both directions."
+---
+
+## Markup
+
+WhatsApp has its own lightweight markup. The adapter converts the Chat SDK's AST to it, and parses inbound text back:
+
+| Markdown        | WhatsApp              |
+| --------------- | --------------------- |
+| `**bold**`      | `*bold*`              |
+| `_italic_`      | `_italic_`            |
+| `~~strike~~`    | `~strike~`            |
+| `` `code` ``    | `` `code` ``          |
+| ` ```block``` ` | ` ```block``` `       |
+| `> quote`       | `> quote`             |
+| `- item`        | `- item`              |
+| `# Heading`     | `*Heading*`           |
+| `[text](url)`   | `text (url)`          |
+| table           | ASCII in a code block |
+
+Headings become bold because WhatsApp has none. Links become `text (url)` because WhatsApp has no link syntax and would otherwise render the brackets literally. Tables become ASCII inside a fence so columns stay aligned in a proportional font.
+
+Cards have no WhatsApp equivalent and render as their fallback text.
+
+The converter is exported if you need it directly:
+
+```ts
+import { WWebJSFormatConverter } from "chat-adapter-wwebjs";
+
+const converter = new WWebJSFormatConverter();
+converter.fromAst(parseMarkdown("**hi**")); // "*hi*"
+converter.toAst("*hi*"); // mdast with a strong node
+```
+
+## Receiving media
+
+An inbound image, video, voice note, sticker or document becomes one `Attachment`. Nothing is downloaded until you ask:
+
+```ts
+bot.onSubscribedMessage(async (thread, message) => {
+  for (const attachment of message.attachments) {
+    const bytes = await attachment.fetchData!();
+    console.log(attachment.type, attachment.mimeType, bytes.byteLength);
+  }
+});
+```
+
+Each attachment carries `fetchMetadata: { messageId }`, so `rehydrateAttachment` can rebuild the download after a message has been serialized through a queue or debounce strategy. That means `fetchData()` still works on a message that came back out of the state adapter.
+
+WhatsApp expires media: once the platform has dropped it, `fetchData()` throws rather than returning empty bytes.
+
+## Sending media
+
+Attach either `files` (bytes you have) or `attachments` (bytes, a fetcher, or a URL):
+
+```ts
+await thread.post({
+  files: [{ data: buffer, filename: "chart.png" }],
+  raw: "This quarter",
+});
+
+await thread.post({
+  attachments: [{ type: "image", url: "https://example.com/chart.png" }],
+  raw: "This quarter",
+});
+```
+
+A `FileUpload` without a `mimeType` gets one inferred from its extension, so `chart.png` is sent as an image rather than a document. A URL-only attachment is fetched by whatsapp-web.js itself.
+
+Stickers need WhatsApp's own flag, so they have a dedicated method:
+
+```ts
+await whatsapp.sendSticker(thread.id, { data: webpBuffer, filename: "face.webp" });
+```
+
+## Emoji
+
+Reactions are normalized to the SDK's `EmojiValue`, so `event.emoji === emoji.thumbs_up` compares cleanly regardless of how the platform encoded it. Sending accepts either an `EmojiValue` or a plain unicode string.

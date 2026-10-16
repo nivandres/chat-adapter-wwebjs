@@ -1,0 +1,58 @@
+---
+title: "Concepts"
+description: "How WhatsApp's model maps onto the Chat SDK's."
+---
+
+## Threads are conversations
+
+WhatsApp has no sub-threads. A chat is one flat stream of messages, so in this adapter a thread **is** a channel: `channelIdFromThreadId` returns the thread ID unchanged, `listThreads` is always empty, and `postChannelMessage` is `postMessage`.
+
+Because contention is per conversation, the adapter declares `lockScope: "channel"`. Two messages in the same chat queue behind each other; two different chats run in parallel.
+
+## Thread IDs
+
+A thread ID is `{adapterName}:{chatId}`, where `chatId` is WhatsApp's own identifier:
+
+| Chat ID                         | Kind       | `isDM`  |
+| ------------------------------- | ---------- | ------- |
+| `15551234567@c.us`              | One-to-one | `true`  |
+| `1234567890-1234567890@g.us`    | Group      | `false` |
+| `120363000000000000@newsletter` | Channel    | `false` |
+
+WhatsApp IDs never contain `:`, so the encoding stays readable and reversible:
+
+```ts
+whatsapp.encodeThreadId({ chatId: "15551234567@c.us" }); // "wwebjs:15551234567@c.us"
+whatsapp.decodeThreadId("wwebjs:15551234567@c.us"); // { chatId: "15551234567@c.us" }
+```
+
+`getChannelVisibility` reports `"external"` for newsletters, which are public broadcasts, and `"private"` for everything else.
+
+## Authors
+
+In a DM the sender is the chat. In a group `from` is the group and `author` is the sender, so the adapter attributes the message to `author` and the thread to the group.
+
+Messages the paired account sent carry `isMe: true` and `isBot: true`, and their author is the account itself. They do not reach your handlers unless you opt in with `receiveOwnMessages`.
+
+<Callout type="warn">
+  `receiveOwnMessages` includes messages this adapter sent, not just ones typed on the phone. Turn
+  it on only when your handlers can tell them apart, or you risk a bot that answers itself.
+</Callout>
+
+## Mentions
+
+WhatsApp mentions are identifiers, not names: the body reads `@15550000000` while the mentioned chat IDs travel beside it in `mentionedIds`. The SDK's own text matching looks for `@your-bot-name` or `@15550000000@c.us`, and would miss this.
+
+So the adapter resolves mentions itself from `mentionedIds` and sets `isMention`, comparing the user part of each ID so a `@lid` mention still matches a `@c.us` account. `@your-bot-name` in the text keeps working through the SDK's matching.
+
+Going the other way, `thread.mentionUser(id)` produces the SDK's `<@id>` token; the adapter rewrites it to `@number` and registers the ID with WhatsApp so the mention renders. A bare `@15551234567` you typed yourself is picked up too.
+
+## Sessions, not webhooks
+
+`connect()` launches a browser, restores or creates a session and resolves once WhatsApp is ready. Until then nothing is received. `handleWebhook` answers `501` — there is no inbound HTTP.
+
+`connect()` is idempotent: concurrent callers share one attempt, and a failed attempt is discarded so you can retry.
+
+## Bring your own client
+
+Pass `client` to drive a `Client` you built yourself — useful when you already manage Puppeteer, want a pinned `webVersionCache`, or need to attach your own listeners. Pass `clientOptions` instead and the adapter constructs one. Either way, `adapter.client` is the live client, so nothing in whatsapp-web.js is out of reach.

@@ -1,0 +1,17 @@
+{
+  "title": "v1",
+  "root": true,
+  "pages": [
+    "index",
+    "---Getting Started---",
+    "quickstart",
+    "concepts",
+    "example",
+    "---Guides---",
+    "messages-and-history",
+    "formatting-and-media",
+    "extensions",
+    "thread-ids-and-multi-account",
+    "events-and-lifecycle"
+  ]
+}

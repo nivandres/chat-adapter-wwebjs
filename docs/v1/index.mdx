@@ -1,0 +1,41 @@
+---
+title: "Introduction"
+description: "Run Chat SDK bots on WhatsApp through whatsapp-web.js."
+---
+
+**`chat-adapter-wwebjs`** is the WhatsApp adapter for the [Chat SDK](https://chat-sdk.dev), built on [whatsapp-web.js](https://wwebjs.dev).
+
+<Callout type="warn" title="Unofficial WhatsApp API">
+  whatsapp-web.js drives WhatsApp Web in a real browser. It is not an official WhatsApp or Meta API,
+  it can break when WhatsApp changes its web client, and WhatsApp may suspend or ban numbers that
+  automate an ordinary account. Evaluate that — and your compliance requirements — before production
+  use.
+</Callout>
+
+Your handlers stay platform-agnostic Chat SDK code. The adapter owns the browser session, message parsing, WhatsApp's markup, media up and download, reactions, receipts and presence.
+
+## Why use it
+
+- **Write once, run anywhere.** The same handlers work on every Chat SDK adapter; adding or swapping a platform does not touch your bot logic.
+- **No Cloud API approval.** Link an ordinary WhatsApp account with a QR or pairing code. No business verification, no message templates, no per-message fees.
+- **Real history.** Unlike socket-only WhatsApp libraries, whatsapp-web.js can page back through a conversation, so `thread.messages` and the SDK history API work without you keeping your own store.
+- **Bring your own client.** Pass an existing `Client` and keep full control of Puppeteer, auth strategy and web-version pinning — or pass nothing and let the adapter build one.
+- **Multi-account ready.** Several numbers on one `Chat` instance, isolated by thread-ID prefix.
+
+## Beyond the official API
+
+Talking to WhatsApp Web directly exposes what the Cloud API restricts:
+
+- **Free-form messaging** with no 24-hour customer-service window and no pre-approved templates.
+- **Reactions**, sent and observed.
+- **Read receipts** on demand, or automatically with `markSeen`.
+- **Presence**: typing, recording, and global online/offline.
+- **Polls** with decrypted votes delivered to `onPollVote`.
+- **Locations, scheduled events, stickers**, message forwarding, pinning, starring and search.
+- **Group data**: participants with admin roles, join and leave events.
+
+## What it is not
+
+It needs a long-lived process with a browser attached, so it is not a webhook adapter — `handleWebhook` answers `501`. To keep the session in one deployment and your bot logic in another, put it behind [`chat-adapter-remote`](https://github.com/nivandres/chat-adapter-remote).
+
+Continue with the [quickstart](./quickstart).

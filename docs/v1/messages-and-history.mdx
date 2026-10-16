@@ -1,0 +1,89 @@
+---
+title: "Messages and history"
+description: "Posting, replying, editing, receipts and paging back through a chat."
+---
+
+## Posting
+
+```ts
+await thread.post("plain text");
+await thread.post({ markdown: "**bold** and _italic_" });
+await thread.post({ files: [{ data: buffer, filename: "report.pdf" }], raw: "Here it is" });
+```
+
+When a message carries both text and media, the text becomes the caption of the first item that can hold one. Audio cannot, so a voice note with text is sent as two messages — the text first, then the audio.
+
+## Replying
+
+`reply` is part of the adapter interface, so the SDK's own reply path produces a native quoted bubble:
+
+```ts
+await thread.reply(message.id, "On it.");
+```
+
+With several attachments only the first message quotes, matching what WhatsApp does natively.
+
+## Editing and deleting
+
+```ts
+const sent = await thread.post("one moment");
+await sent.edit("done");
+await sent.delete();
+```
+
+WhatsApp only allows editing your own messages within 15 minutes. Past that the platform refuses and the adapter throws a `ValidationError` saying so, rather than failing silently. `delete()` removes the message for everyone.
+
+## Read receipts
+
+```ts
+await thread.markAsRead(message.id);
+```
+
+WhatsApp acknowledges a whole conversation rather than one message, so this marks the chat seen. To acknowledge everything as it arrives, set `markSeen: true` on the adapter.
+
+## Typing
+
+```ts
+await thread.startTyping(); // "typing…"
+await thread.startTyping("recording"); // "recording audio…"
+await whatsapp.endTyping(thread.id); // clear it
+```
+
+WhatsApp clears the indicator on its own after about 25 seconds.
+
+## History
+
+`fetchMessages` reads real history, so `thread.messages` and the SDK's history API work without your own message store:
+
+```ts
+const recent = await whatsapp.fetchMessages(thread.id, { limit: 50 });
+const older = await whatsapp.fetchMessages(thread.id, { cursor: recent.nextCursor, limit: 50 });
+
+for await (const message of thread.messages) {
+  console.log(message.text);
+}
+```
+
+Cursors are offsets counted from the newest message. Each page is returned oldest-first, which is the SDK's contract.
+
+<Callout>
+  **Backward** (the default) asks WhatsApp for `offset + limit` messages and returns the page —
+  cheap, and what a chat view wants. **Forward** loads the conversation and slices, because WhatsApp
+  exposes no oldest-first cursor, so use it for one-off backfills rather than per-request paging.
+</Callout>
+
+Both only see what the web client has synced. A conversation the session has never opened may return nothing until WhatsApp backfills it; `chat.syncHistory()` on the underlying client can ask for more.
+
+Single messages come back by ID, and answer `null` rather than throwing when they are gone:
+
+```ts
+const message = await whatsapp.fetchMessage(thread.id, messageId);
+```
+
+## Searching
+
+```ts
+const hits = await whatsapp.searchMessages("invoice", { limit: 20, threadId: thread.id });
+```
+
+Omit `threadId` to search every chat.

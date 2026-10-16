@@ -1,0 +1,79 @@
+---
+title: "Events and lifecycle"
+description: "What reaches your handlers, and how the session starts and stops."
+---
+
+## Lifecycle
+
+```ts
+await bot.initialize(); // wires the SDK into the adapter
+await whatsapp.connect(); // launches the browser, waits for "ready"
+// …
+await whatsapp.disconnect(); // closes the browser
+```
+
+`connect()` resolves once WhatsApp reports ready, and rejects if authentication fails. It is idempotent — concurrent callers share one attempt — and a failed attempt is cleared, so you can retry.
+
+Handlers must be registered and `bot.initialize()` awaited first. The adapter warns if you connect before the SDK is attached, because messages arriving in that window are dropped.
+
+If `userName` was not configured, the account's WhatsApp push name is adopted once the session is ready, so `@`-mentions by name match what people actually see.
+
+## What reaches the SDK
+
+| whatsapp-web.js event     | Chat SDK                     |
+| ------------------------- | ---------------------------- |
+| `message_create`          | `processMessage`             |
+| `message_edit`            | `processMessageUpdated`      |
+| `message_revoke_everyone` | `processMessageDeleted`      |
+| `message_reaction`        | `processReaction`            |
+| `group_join`              | `processMemberJoinedChannel` |
+
+The adapter listens to `message_create` rather than `message`, so it sees the paired account's own messages and can decide what to do with them. By default it drops them; `receiveOwnMessages: true` passes them through.
+
+An inbound message with a quote resolves it, so `message.replyTo` is the quoted message rather than just an ID.
+
+## Edits and deletes
+
+An edit carries both sides:
+
+```ts
+bot.onMessageUpdated(async (thread, message, previous) => {
+  console.log(previous?.text, "→", message.text);
+});
+```
+
+A delete carries the original when whatsapp-web.js captured it before WhatsApp replaced it with a tombstone:
+
+```ts
+bot.onMessageDeleted((event) => {
+  console.log(event.messageId, event.previousMessage?.text);
+});
+```
+
+`previousMessage` is best-effort — WhatsApp does not guarantee the original is still in the web client's cache.
+
+## Adapter-only events
+
+Some WhatsApp events have no Chat SDK equivalent and are delivered on the adapter:
+
+```ts
+whatsapp.onPollVote((vote) => {});
+whatsapp.onCall((call) => {});
+whatsapp.onAck((ack) => {});
+whatsapp.onGroupEvent((event) => {});
+```
+
+Handlers run in registration order, and one that throws is logged without stopping the rest.
+
+## Errors
+
+Failures surface as the shared adapter error types from `@chat-adapter/shared`:
+
+- `ResourceNotFoundError` — the chat or message is not in the session's cache.
+- `ValidationError` — a thread ID for another adapter, a poll outside 2–12 options, coordinates out of range, an attachment with nothing to send, or an edit WhatsApp refused.
+
+The session's cache is the recurring theme: whatsapp-web.js can only act on what the web client currently holds, so an old message may be genuinely unreachable even though it exists on someone's phone.
+
+## Reconnection
+
+whatsapp-web.js manages its own reconnects inside the browser. A `disconnected` event is logged; if the session is lost for good — the device was unlinked — the process needs to re-link, so treat repeated disconnects as a signal to restart and show a fresh QR.

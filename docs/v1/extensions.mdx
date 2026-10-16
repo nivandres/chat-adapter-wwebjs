@@ -1,0 +1,127 @@
+---
+title: "Extensions"
+description: "WhatsApp capabilities that live past the shared Adapter interface."
+---
+
+The Chat SDK interface is platform-agnostic, so WhatsApp-only features live on the adapter itself. Reach it in a handler with `requireWWebJSAdapter`, which accepts a `Thread`, a `Channel` or an adapter and throws if it belongs to another platform:
+
+```ts
+import { requireWWebJSAdapter } from "chat-adapter-wwebjs";
+
+bot.onSubscribedMessage(async (thread) => {
+  const wa = requireWWebJSAdapter(thread);
+});
+```
+
+`isWWebJSAdapter` is the non-throwing guard, for bots running several platforms at once.
+
+## Polls
+
+whatsapp-web.js decrypts votes for you, so a poll is two calls:
+
+```ts
+const poll = await wa.sendPoll({
+  options: ["Tacos", "Sushi", "Ramen"],
+  question: "Lunch?",
+  threadId: thread.id,
+});
+
+wa.onPollVote(poll.id, async (vote) => {
+  await thread.post(`${vote.voter.userName} picked ${vote.selectedOptions.join(", ")}`);
+});
+```
+
+Pass a handler alone to hear every poll, or an array of IDs to scope it to several. An empty `selectedOptions` means the voter cleared their vote. WhatsApp allows 2 to 12 options; anything else is rejected before it reaches the platform.
+
+## Locations and events
+
+```ts
+await wa.sendLocation({
+  address: "San Francisco, CA",
+  latitude: 37.7749,
+  longitude: -122.4194,
+  name: "San Francisco",
+  threadId: thread.id,
+});
+
+await wa.sendEvent({
+  callType: "video",
+  description: "Weekly sync",
+  name: "Standup",
+  startTime: new Date("2026-01-01T09:00:00Z"),
+  threadId: thread.id,
+});
+```
+
+Coordinates outside their valid range are rejected before the send.
+
+## Messages
+
+```ts
+await wa.forwardMessage(message.id, otherThreadId);
+await wa.pinMessage(message.id, 86_400);
+await wa.unpinMessage(message.id);
+await wa.starMessage(message.id);
+const pinned = await wa.fetchPinnedMessages(thread.id);
+```
+
+`fetchPinnedMessages` returns parsed Chat SDK messages, not raw ones.
+
+## Groups
+
+```ts
+const participants = await wa.fetchGroupParticipants(thread.id);
+const admins = participants.filter((p) => p.isAdmin);
+```
+
+Throws if the thread is not a group. Membership and metadata changes arrive through `onGroupEvent`:
+
+```ts
+wa.onGroupEvent((event) => {
+  // event.type: "join" | "leave" | "update" | "admin_changed" | "membership_request"
+  console.log(event.type, event.userIds);
+});
+```
+
+Joins are also bridged to the SDK's `onMemberJoinedChannel`.
+
+## Presence and chat state
+
+```ts
+await wa.setPresence("available");
+await wa.markAsUnread(thread.id);
+await wa.muteThread(thread.id, new Date(Date.now() + 3_600_000));
+await wa.unmuteThread(thread.id);
+await wa.archiveThread(thread.id);
+await wa.unarchiveThread(thread.id);
+await wa.pinThread(thread.id);
+const avatar = await wa.getProfilePicUrl("15551234567");
+```
+
+`getProfilePicUrl` answers `undefined` rather than throwing when privacy settings hide the picture.
+
+## Calls and delivery
+
+```ts
+wa.onCall(async (call) => {
+  await call.reject();
+});
+
+wa.onAck((ack) => {
+  // "pending" | "sent" | "delivered" | "read" | "played" | "error"
+  console.log(ack.messageId, ack.status);
+});
+```
+
+A handler that throws is logged and the remaining handlers still run.
+
+## The escape hatch
+
+Anything not wrapped here is one property away:
+
+```ts
+const version = await wa.client.getWWebVersion();
+const chats = await wa.client.getChats();
+```
+
+`adapter.client` is the whatsapp-web.js `Client` itself, so the whole library remains available.
