@@ -52,4 +52,10 @@ describe("jid", () => {
       expect(result.mentions).toEqual([]);
     });
   });
+
+  it("rewrites mention tokens in linear time, whatever the input", () => {
+    const started = Date.now();
+    extractMentions("<@".repeat(32_000));
+    expect(Date.now() - started).toBeLessThan(50);
+  });
 });

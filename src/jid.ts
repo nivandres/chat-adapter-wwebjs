@@ -49,7 +49,7 @@ export function toUser(chatId: string): string {
  */
 export function extractMentions(text: string): { mentions: string[]; text: string } {
   const mentions = new Set<string>();
-  const rendered = text.replace(/<@([^\s>]+)>/g, (_match, id: string) => {
+  const rendered = text.replace(/<@([^\s<>]+)>/g, (_match, id: string) => {
     const chatId = toChatId(id);
     mentions.add(chatId);
     return `@${toUser(chatId)}`;

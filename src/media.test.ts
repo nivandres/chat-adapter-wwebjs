@@ -137,22 +137,85 @@ describe("toMedia", () => {
     expect((await toMedia(attachment)).data).toBe(base64("lazy"));
   });
 
-  it("lets WhatsApp fetch a URL-only attachment", async () => {
-    const spy = vi
-      .spyOn(MessageMedia, "fromUrl")
-      .mockResolvedValue(new MessageMedia("image/png", base64("remote")));
-    await toMedia({ name: "a.png", type: "image", url: "https://example.com/a.png" });
-    expect(spy).toHaveBeenCalledWith("https://example.com/a.png", {
+  it("fetches a URL-only attachment, typed by the response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("remote", { headers: { "content-type": "image/png" } })),
+    );
+    const media = await toMedia({ type: "image", url: "https://example.com/a.png" });
+    expect(media).toMatchObject({
+      data: base64("remote"),
       filename: "a.png",
-      unsafeMime: true,
+      mimetype: "image/png",
     });
+  });
+
+  it("refuses a URL that answers with an error rather than sending the error page", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("INTERNAL-SECRET", { status: 500 })),
+    );
+    await expect(toMedia({ type: "image", url: "https://example.com/a.png" })).rejects.toThrow(
+      "HTTP 500",
+    );
+  });
+
+  it("stops reading a URL past the size limit", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("x".repeat(10))),
+    );
+    await expect(toMedia({ type: "image", url: "https://example.com/a.png" }, 4)).rejects.toThrow(
+      "over the 4-byte limit",
+    );
+  });
+
+  it("never takes a MIME type from the object prototype", async () => {
+    const media = await toMedia({ data: Buffer.from("x"), filename: "a.__proto__" });
+    expect(media.mimetype).toBe("application/octet-stream");
   });
 
   it("refuses an attachment with nothing to send", async () => {
     await expect(toMedia({ type: "image" })).rejects.toThrow("no data, fetchData, or url");
   });
 
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("download", () => {
+  const stream = (size: number) => ({
+    stream: (async function* () {
+      for (let sent = 0; sent < size; sent += 4) yield Buffer.alloc(Math.min(4, size - sent));
+    })(),
+  });
+
+  it("counts the bytes it streams, whatever size the sender declared", async () => {
+    const message = waMessage({
+      downloadMediaStream: vi.fn(async () => stream(10)),
+      hasMedia: true,
+      rawData: { size: 1 },
+    });
+    await expect(download(message, 8)).rejects.toThrow("over the 8-byte limit");
+  });
+
+  it("returns the streamed bytes when they fit", async () => {
+    const message = waMessage({
+      downloadMediaStream: vi.fn(async () => stream(6)),
+      hasMedia: true,
+    });
+    expect((await download(message, 8)).length).toBe(6);
+  });
+
+  it("checks the size of media handed over whole, when it cannot stream", async () => {
+    const message = waMessage({
+      downloadMedia: vi.fn(async () => ({ data: base64("123456789") })),
+      hasMedia: true,
+    });
+    await expect(download(message, 8)).rejects.toThrow("over the 8-byte limit");
+  });
 });
 
 describe("toMediaList", () => {

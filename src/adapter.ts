@@ -101,6 +101,10 @@ const SYSTEM_TYPES = new Set([
 ]);
 
 const DEFAULT_LIMIT = 50;
+/** WhatsApp Web loads history into the page, so a read is bounded however far a cursor reaches. */
+const MAX_HISTORY = 1000;
+/** Contact lookups per message, so a message listing hundreds of mentions cannot queue hundreds of them. */
+const MAX_MENTION_LOOKUPS = 20;
 const RECONNECT_MIN_MS = 5_000;
 const RECONNECT_MAX_MS = 300_000;
 const MAX_POLL_OPTIONS = 12;
@@ -132,6 +136,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   private _botLid?: string;
   private _closed = false;
   private _retry?: ReturnType<typeof setTimeout>;
+  private _initialized = false;
 
   constructor(config: WWebJSAdapterConfig = {}) {
     const name = config.adapterName ?? "wwebjs";
@@ -170,6 +175,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       );
     }
     this._closed = false;
+    clearTimeout(this._retry);
     this._connection ??= this._connect().catch((error: unknown) => {
       this._connection = null;
       throw error;
@@ -434,7 +440,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   /** Send a scheduled event card. */
   async sendEvent(args: WWebJSSendEventArgs): Promise<RawMessage<WAMessage>> {
     const event = new ScheduledEvent(args.name, args.startTime, {
-      callType: args.callType,
+      callType: args.callType ?? "none",
       description: args.description,
       endTime: args.endTime,
       location: args.location,
@@ -448,7 +454,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     threadId: string,
     source: Attachment | Parameters<typeof toMedia>[0],
   ): Promise<RawMessage<WAMessage>> {
-    return this._sendContent(threadId, await toMedia(source), { sendMediaAsSticker: true });
+    return this._sendContent(threadId, await toMedia(source, this._config.maxMediaBytes), {
+      sendMediaAsSticker: true,
+    });
   }
 
   /** Forward an existing message into another thread. */
@@ -624,7 +632,16 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       this.client.on("ready", onReady);
       this.client.on("auth_failure", onFailure);
     });
+    // A previous session's browser is closed first, or every reconnect would leave one running.
+    if (this._initialized) await this.client.destroy().catch(() => undefined);
+    this._initialized = true;
     await this.client.initialize();
+    if (this._closed) {
+      await this.client.destroy();
+      return;
+    }
+    // A crashed browser ends the session without WhatsApp ever reporting a disconnect.
+    this.client.pupBrowser?.once("disconnected", () => this._onDisconnected("BROWSER_CLOSED"));
     await ready;
   }
 
@@ -641,7 +658,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       void this._learnLid();
     });
     this.client.on("disconnected", (reason) => this._onDisconnected(String(reason)));
-    this.client.on("message_create", (message) => void this._onMessage(message));
+    this.client.on("message_create", (message) => this._guard("message", this._onMessage(message)));
     this.client.on("message_edit", (message, _new, previous) =>
       this._onEdit(message, String(previous)),
     );
@@ -650,7 +667,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     );
     this.client.on("message_reaction", (reaction) => this._onReaction(reaction));
     this.client.on("message_ack", (message, ack) => this._onAck(message, ack));
-    this.client.on("vote_update", (vote) => void this._onVote(vote));
+    this.client.on("vote_update", (vote) => this._guard("poll vote", this._onVote(vote)));
     this.client.on("call", (call) => void this._dispatch(this._callHandlers, call, "onCall"));
     for (const [event, type] of Object.entries(GROUP_EVENTS)) {
       this.client.on(event, (notification: GroupNotification) => this._onGroup(type, notification));
@@ -754,6 +771,8 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
   private async _onVote(vote: PollVote): Promise<void> {
     const parent = vote.parentMessage;
+    // Unloadable polls arrive without a parent, and polls sent by others are not this account's to count.
+    if (!parent?.id || !parent.fromMe) return;
     const pollMessageId = parent.id._serialized;
     const payload: WWebJSPollVote = {
       options: parent.pollOptions ?? [],
@@ -790,7 +809,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   private async _parse(raw: WAMessage): Promise<Message<WAMessage>> {
     const parsed = this.parseMessage(raw);
     const bot = this._botUsers();
-    const others = (raw.mentionedIds ?? []).map(serialize).filter((id) => !bot.has(toUser(id)));
+    const others = [
+      ...new Set((raw.mentionedIds ?? []).map(serialize).filter((id) => !bot.has(toUser(id)))),
+    ].slice(0, MAX_MENTION_LOOKUPS);
     if (others.length > 0) {
       const names = new Map<string, string>();
       for (const id of others) {
@@ -854,7 +875,11 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
   /** WhatsApp writes a mention as `@` and the number or LID; readers expect the name. */
   private _named(text: string, users: string[], name: (user: string) => string): string {
-    return users.reduce((named, user) => named.replaceAll(`@${user}`, `@${name(user)}`), text);
+    // A replacer function, so a name the sender chose cannot carry `$'` or `$&` patterns.
+    return users.reduce(
+      (named, user) => named.replaceAll(`@${user}`, () => `@${name(user)}`),
+      text,
+    );
   }
 
   private async _learnLid(): Promise<void> {
@@ -868,11 +893,19 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     }
   }
 
+  /** Listeners run unawaited, so a rejection here would end the process. */
+  private _guard(label: string, work: Promise<unknown>): void {
+    work.catch((error: unknown) =>
+      this._logger.warn(`Inbound ${label} was not handled`, { error }),
+    );
+  }
+
   private _isOwn(fromMe: boolean): boolean {
     return fromMe && !this._config.receiveOwnMessages;
   }
 
   private _onDisconnected(reason: string): void {
+    if (this._closed) return;
     this._connection = null;
     if (reason === "LOGOUT") {
       this._logger.error("WhatsApp logged this session out; pair it again to reconnect", {
@@ -886,6 +919,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
   private _reconnect(delayMs: number): void {
     if (this._closed || this._config.reconnect === false) return;
+    clearTimeout(this._retry);
     this._retry = setTimeout(() => {
       this.connect().catch((error: unknown) => {
         this._logger.warn("Reconnecting to WhatsApp failed", { error, delayMs });
@@ -909,7 +943,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   ): Promise<RawMessage<WAMessage>> {
     const { chatId } = this.decodeThreadId(threadId);
     const { mentions, text } = extractMentions(this._render(message));
-    const media = await toMediaList(message);
+    const media = await toMediaList(message, this._config.maxMediaBytes);
     const send: MessageSendOptions = {
       ...options,
       ...(mentions.length > 0 ? { mentions } : {}),
@@ -951,11 +985,13 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   }
 
   private async _page(chat: WAChat, options?: FetchOptions): Promise<FetchResult<WAMessage>> {
-    const limit = Math.max(1, options?.limit ?? DEFAULT_LIMIT);
-    const offset = Math.max(0, Number(options?.cursor ?? 0) || 0);
+    const limit = Math.min(MAX_HISTORY, Math.max(1, options?.limit ?? DEFAULT_LIMIT));
+    const offset = Math.min(MAX_HISTORY, Math.max(0, Number(options?.cursor ?? 0) || 0));
     const forward = options?.direction === "forward";
 
-    const window = await chat.fetchMessages({ limit: forward ? Infinity : offset + limit });
+    const window = await chat.fetchMessages({
+      limit: forward ? MAX_HISTORY : Math.min(MAX_HISTORY, offset + limit),
+    });
     const start = forward ? offset : Math.max(0, window.length - offset - limit);
     const end = forward ? Math.min(window.length, offset + limit) : window.length - offset;
     const page = end > start ? window.slice(start, end) : [];

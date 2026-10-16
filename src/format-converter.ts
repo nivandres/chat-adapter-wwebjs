@@ -7,6 +7,12 @@ import {
   type Root,
 } from "chat";
 
+const MAX_MARKDOWN_LENGTH = 16_000;
+
+function plain(value: string): Root {
+  return { children: [{ children: [{ type: "text", value }], type: "paragraph" }], type: "root" };
+}
+
 /**
  * Converts between WhatsApp's markup and the Chat SDK's mdast AST.
  *
@@ -16,12 +22,18 @@ import {
  * inside a code block.
  */
 export class WWebJSFormatConverter extends BaseFormatConverter {
+  /** Text from anyone: past `MAX_MARKDOWN_LENGTH`, or when the parser gives up, it stays plain rather than stalling or throwing. */
   toAst(platformText: string): Root {
-    return parseMarkdown(
-      platformText
-        .replace(/(?<!\*)\*(?!\*)([^*\n]+?)\*(?!\*)/g, "**$1**")
-        .replace(/(?<!~)~(?!~)([^~\n]+?)~(?!~)/g, "~~$1~~"),
-    );
+    if (platformText.length > MAX_MARKDOWN_LENGTH) return plain(platformText);
+    try {
+      return parseMarkdown(
+        platformText
+          .replace(/(?<!\*)\*(?!\*)([^*\n]+?)\*(?!\*)/g, "**$1**")
+          .replace(/(?<!~)~(?!~)([^~\n]+?)~(?!~)/g, "~~$1~~"),
+      );
+    } catch {
+      return plain(platformText);
+    }
   }
 
   fromAst(ast: Root): string {

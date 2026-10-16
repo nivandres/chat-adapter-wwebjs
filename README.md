@@ -77,11 +77,11 @@ None. This adapter takes no credentials from the environment — a WhatsApp Web 
 | `clientOptions`      | `ClientOptions`             | `{}`            | Options for the client the adapter builds — `authStrategy`, `puppeteer`, `webVersionCache`, and so on. Ignored when `client` is set. |
 | `logger`             | `Logger`                    | `ConsoleLogger` | Logger used until `Chat` hands over its own.                                                                                         |
 | `markSeen`           | `boolean`                   | `false`         | Send a read receipt for every inbound message as it arrives.                                                                         |
-| `maxMediaBytes`      | `number`                    | 64 MB           | Largest inbound media `fetchData()` downloads. Larger media is refused before it is read into memory.                                |
+| `maxMediaBytes`      | `number`                    | 64 MB           | Largest media read into memory, inbound or fetched from a `url`. Bytes are counted as they arrive, whatever size the sender claims.  |
 | `onPairingCode`      | `(code: string) => unknown` | —               | Receives the 8-character pairing code when `phoneNumber` is set.                                                                     |
 | `onQR`               | `(qr: string) => unknown`   | —               | Receives the QR string during login. Render it with `qrcode-terminal` or similar.                                                    |
 | `phoneNumber`        | `string`                    | —               | Log in with a pairing code instead of a QR. E.164 without the leading `+`.                                                           |
-| `receiveOwnMessages` | `boolean`                   | `false`         | Deliver what the paired account did — its messages, edits, deletes and reactions — to your handlers.                                 |
+| `receiveOwnMessages` | `boolean`                   | `false`         | Pass what the paired account did — its messages, edits, deletes and reactions — to the Chat SDK, which still skips most of its own.  |
 | `reconnect`          | `boolean`                   | `true`          | Open the session again when WhatsApp drops it, backing off from 5 seconds to 5 minutes. A logout is never retried.                   |
 | `userName`           | `string`                    | `"wwebjs-bot"`  | Bot display name. When unset, the account's WhatsApp push name is adopted once the session is ready.                                 |
 
@@ -168,8 +168,10 @@ const bot = new Chat({ adapters: { sales, support }, state, userName: "my-bot" }
 - **No ephemeral messages, scheduling, or modals.** `postEphemeral` falls back to a DM; `thread.schedule()` throws.
 - **No sub-threads.** A WhatsApp conversation is one flat stream, so `listThreads` is always empty and a channel is its own thread.
 - **`receiveOwnMessages` includes the adapter's own sends.** Turn it on only if your handlers can tell them apart.
-- **History is what the web client synced**, not WhatsApp's full server-side archive.
+- **History is what the web client synced**, not WhatsApp's full server-side archive, and one read reaches back at most 1,000 messages.
+- **An attachment given only by `url` is fetched from the host's network**, with a 30-second timeout and `maxMediaBytes` as its limit. Never pass one an end user chose.
 - **Statuses, broadcast lists and WhatsApp's own notifications never reach your handlers.**
+- **`forwardMessage` and event call links fail on current WhatsApp Web.** whatsapp-web.js still calls modules WhatsApp has renamed; both return once it catches up. `sendEvent` without `callType` attaches no link and works.
 - **Messages received while the session was down are not replayed.** WhatsApp Web syncs them into history, where `fetchMessages` finds them, but no event fires for them.
 
 ## License

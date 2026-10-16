@@ -170,7 +170,7 @@ export interface WWebJSSendPollArgs {
 
 /** Named arguments for {@link WWebJSAdapter.sendEvent}. */
 export interface WWebJSSendEventArgs {
-  /** Type of WhatsApp call link to attach. */
+  /** Type of WhatsApp call link to attach. Defaults to `"none"`. */
   callType?: "none" | "video" | "voice";
   /** Event description. */
   description?: string;

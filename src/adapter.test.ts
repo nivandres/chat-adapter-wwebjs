@@ -448,6 +448,20 @@ describe("WWebJSAdapter", () => {
       expect(last.nextCursor).toBeUndefined();
     });
 
+    it("bounds how much history it asks WhatsApp Web for, however far the cursor reaches", async () => {
+      const { adapter } = await connected(
+        {},
+        { getChatById: vi.fn(async () => waChat({ fetchMessages })) },
+      );
+      await adapter.fetchMessages(THREAD, { direction: "forward" });
+      await adapter.fetchMessages(THREAD, { cursor: "9999999", limit: 9_999_999 });
+
+      for (const [request] of fetchMessages.mock.calls as unknown as [{ limit: number }][]) {
+        expect(request.limit).toBeLessThanOrEqual(1000);
+        expect(Number.isFinite(request.limit)).toBe(true);
+      }
+    });
+
     it("fetches a single message by ID and answers null when it is gone", async () => {
       const { adapter } = await connected();
       expect((await adapter.fetchMessage(THREAD, "ID"))?.threadId).toBe(THREAD);
@@ -667,6 +681,46 @@ describe("WWebJSAdapter", () => {
 
       const message = await chat.processMessage.mock.calls[0]![2]();
       expect(message.text).toBe("@Ana y @5552 vengan");
+    });
+
+    it("survives a handler that fails, rather than ending the process", async () => {
+      const { chat, client } = await connected();
+      chat.processMessage.mockImplementation(() => Promise.reject(new Error("LockError")));
+      client.emit("message_create", waMessage());
+      await flush();
+      await flush();
+      expect(chat.processMessage).toHaveBeenCalled();
+    });
+
+    it("keeps a name the sender chose literal, `$` patterns included", async () => {
+      const { chat, client } = await connected(
+        {},
+        { getContactById: vi.fn(async () => ({ pushname: "$'$'$&" })) },
+      );
+      client.emit(
+        "message_create",
+        waMessage({ body: "@5551 tail", mentionedIds: ["5551@lid", "5551@lid"], remote: GROUP }),
+      );
+      await flush();
+
+      const message = await chat.processMessage.mock.calls[0]![2]();
+      expect(message.text).toBe("@$'$'$& tail");
+    });
+
+    it("looks up a bounded number of mentioned contacts", async () => {
+      const getContactById = vi.fn(async () => null);
+      const { chat, client } = await connected({}, { getContactById });
+      client.emit(
+        "message_create",
+        waMessage({
+          mentionedIds: Array.from({ length: 500 }, (_, index) => `${index}@lid`),
+          remote: GROUP,
+        }),
+      );
+      await flush();
+      await chat.processMessage.mock.calls[0]![2]();
+
+      expect(getContactById.mock.calls.length).toBeLessThanOrEqual(20);
     });
 
     it("treats a reply to one of the bot's messages as a mention", async () => {
@@ -914,6 +968,20 @@ describe("WWebJSAdapter", () => {
       });
     });
 
+    it("ignores votes on polls it cannot load or did not send", async () => {
+      const { adapter, client } = await connected();
+      const votes: unknown[] = [];
+      adapter.onPollVote((poll) => votes.push(poll));
+      client.emit("vote_update", { ...vote, parentMessage: null });
+      client.emit("vote_update", { ...vote, parentMessage: {} });
+      client.emit("vote_update", {
+        ...vote,
+        parentMessage: waMessage({ fromMe: false, messageId: "THEIRS", pollOptions: [] }),
+      });
+      await flush();
+      expect(votes).toEqual([]);
+    });
+
     it("only fires handlers scoped to the poll that was voted on", async () => {
       const { adapter, client } = await connected();
       const matching: unknown[] = [];
@@ -969,6 +1037,21 @@ describe("WWebJSAdapter", () => {
         threadId: THREAD,
       });
       expect(client.sendMessage.mock.calls[0]![1]).toMatchObject({ name: "Standup" });
+    });
+
+    it("attaches no call link unless one is asked for, which WhatsApp can no longer generate", async () => {
+      const { adapter, client } = await connected();
+      await adapter.sendEvent({ name: "Standup", startTime: new Date(), threadId: THREAD });
+      await adapter.sendEvent({
+        callType: "video",
+        name: "Standup",
+        startTime: new Date(),
+        threadId: THREAD,
+      });
+
+      const [plain, video] = client.sendMessage.mock.calls.map((call) => call[1] as never);
+      expect(plain).toMatchObject({ eventSendOptions: { callType: "none" } });
+      expect(video).toMatchObject({ eventSendOptions: { callType: "video" } });
     });
 
     it("sends an image as a sticker", async () => {
@@ -1092,6 +1175,61 @@ describe("WWebJSAdapter", () => {
         expect(client.initialize).toHaveBeenCalledTimes(1);
         await vi.advanceTimersByTimeAsync(1);
         expect(client.initialize).toHaveBeenCalledTimes(2);
+      });
+
+      it("opens it again once the browser crashes, which WhatsApp never reports", async () => {
+        const browser = new EventEmitter();
+        const { adapter, client } = await connected({}, { pupBrowser: browser });
+        const first = adapter.connect();
+        client.emit("ready");
+        await first;
+
+        browser.emit("disconnected");
+        client.emit("disconnected", "CONFLICT");
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(client.destroy).toHaveBeenCalledTimes(1);
+        expect(client.initialize).toHaveBeenCalledTimes(2);
+      });
+
+      it("does not reopen a browser closed on purpose", async () => {
+        const browser = new EventEmitter();
+        const { adapter, client } = await connected({}, { pupBrowser: browser });
+        const first = adapter.connect();
+        client.emit("ready");
+        await first;
+
+        await adapter.disconnect();
+        browser.emit("disconnected");
+        await vi.advanceTimersByTimeAsync(600_000);
+
+        expect(client.initialize).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not let a pending retry tear down a session opened in the meantime", async () => {
+        const { adapter, client } = await connected();
+        client.emit("disconnected", "CONFLICT");
+        const reopened = adapter.connect();
+        client.emit("ready");
+        await reopened;
+
+        await vi.advanceTimersByTimeAsync(600_000);
+        expect(client.destroy).not.toHaveBeenCalled();
+        expect(client.initialize).toHaveBeenCalledTimes(1);
+      });
+
+      it("closes a session that finishes opening after disconnect()", async () => {
+        let opened!: () => void;
+        const { adapter, client } = await connected(
+          {},
+          { initialize: vi.fn(() => new Promise<void>((resolve) => (opened = resolve))) },
+        );
+        const attempt = adapter.connect();
+        await adapter.disconnect();
+        opened();
+        await attempt;
+
+        expect(client.destroy).toHaveBeenCalledTimes(2);
       });
 
       it("never retries a logout, which needs a new pairing", async () => {

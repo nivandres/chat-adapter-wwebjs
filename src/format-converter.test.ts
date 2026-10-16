@@ -72,4 +72,14 @@ describe("WWebJSFormatConverter", () => {
       expect(converter.renderPostable({ markdown: "**bold**" })).toBe("*bold*");
     });
   });
+
+  it("keeps text from anyone plain rather than stalling or throwing on it", () => {
+    const converter = new WWebJSFormatConverter();
+    expect(() => converter.toAst("> ".repeat(8000))).not.toThrow();
+
+    const started = Date.now();
+    const ast = converter.toAst("*a".repeat(32_000));
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(ast.type).toBe("root");
+  });
 });

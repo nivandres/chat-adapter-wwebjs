@@ -1,5 +1,6 @@
 import { extractFiles, extractPostableAttachments, ValidationError } from "@chat-adapter/shared";
 import type { AdapterPostableMessage, Attachment, FileUpload } from "chat";
+import type { Readable } from "node:stream";
 import type { Message as WAMessage, MessageMedia as WAMessageMedia } from "whatsapp-web.js";
 import { MessageMedia } from "./wwebjs.js";
 
@@ -33,6 +34,12 @@ const MIME_TYPES: Record<string, string> = {
 
 const DEFAULT_MIME_TYPE = "application/octet-stream";
 const DEFAULT_MAX_MEDIA_BYTES = 64 * 1024 * 1024;
+const URL_TIMEOUT_MS = 30_000;
+
+/** whatsapp-web.js main streams media in chunks; 1.34.7 only hands it over whole. */
+type StreamableMessage = WAMessage & {
+  downloadMediaStream?: () => Promise<{ stream: Readable } | undefined>;
+};
 
 interface RawMediaData {
   filename?: string;
@@ -67,31 +74,42 @@ export async function download(
   maxBytes = DEFAULT_MAX_MEDIA_BYTES,
 ): Promise<Buffer> {
   const size = ((message.rawData ?? {}) as RawMediaData).size;
-  if (size && size > maxBytes) {
-    throw new ValidationError(
-      "wwebjs",
-      `Media for message ${message.id._serialized} is ${size} bytes, over the ${maxBytes}-byte limit.`,
-    );
+  if (size && size > maxBytes) throw tooLarge(message.id._serialized, size, maxBytes);
+  // The declared size is the sender's to set, so the bytes themselves are counted too.
+  const { downloadMediaStream } = message as StreamableMessage;
+  if (downloadMediaStream) {
+    const streamed = await downloadMediaStream.call(message);
+    if (!streamed) throw unavailable(message.id._serialized);
+    return collect(streamed.stream, maxBytes, message.id._serialized);
   }
   const media = await message.downloadMedia();
-  if (!media?.data) {
-    throw new ValidationError(
-      "wwebjs",
-      `Media for message ${message.id._serialized} is no longer available for download.`,
-    );
-  }
-  return Buffer.from(media.data, "base64");
+  if (!media?.data) throw unavailable(message.id._serialized);
+  const data = Buffer.from(media.data, "base64");
+  if (data.length > maxBytes) throw tooLarge(message.id._serialized, data.length, maxBytes);
+  return data;
 }
 
 /** Convert every attachment and file on a postable message into WhatsApp media. */
-export function toMediaList(message: AdapterPostableMessage): Promise<WAMessageMedia[]> {
+export function toMediaList(
+  message: AdapterPostableMessage,
+  maxBytes?: number,
+): Promise<WAMessageMedia[]> {
   return Promise.all(
-    [...extractPostableAttachments(message), ...extractFiles(message)].map(toMedia),
+    [...extractPostableAttachments(message), ...extractFiles(message)].map((source) =>
+      toMedia(source, maxBytes),
+    ),
   );
 }
 
-/** Convert a single attachment or file upload into WhatsApp media. */
-export async function toMedia(source: Attachment | FileUpload): Promise<WAMessageMedia> {
+/**
+ * Convert a single attachment or file upload into WhatsApp media. An attachment
+ * given only by `url` is fetched from the host's own network, so never pass one
+ * an end user chose.
+ */
+export async function toMedia(
+  source: Attachment | FileUpload,
+  maxBytes = DEFAULT_MAX_MEDIA_BYTES,
+): Promise<WAMessageMedia> {
   if ("filename" in source) {
     return new MessageMedia(
       source.mimeType ?? mimeTypeOf(source.filename),
@@ -104,7 +122,7 @@ export async function toMedia(source: Attachment | FileUpload): Promise<WAMessag
     if (!source.url) {
       throw new ValidationError("wwebjs", "Attachment has no data, fetchData, or url to send.");
     }
-    return MessageMedia.fromUrl(source.url, { unsafeMime: true, filename: source.name });
+    return fetchMedia(source.url, source, maxBytes);
   }
   return new MessageMedia(
     source.mimeType ?? mimeTypeOf(source.name),
@@ -121,7 +139,58 @@ export function isCaptionable(media: WAMessageMedia): boolean {
 
 function mimeTypeOf(filename?: string): string {
   const extension = filename?.split(".").pop()?.toLowerCase();
-  return (extension && MIME_TYPES[extension]) || DEFAULT_MIME_TYPE;
+  return (
+    (extension && Object.hasOwn(MIME_TYPES, extension) && MIME_TYPES[extension]) ||
+    DEFAULT_MIME_TYPE
+  );
+}
+
+async function fetchMedia(
+  url: string,
+  source: Attachment,
+  maxBytes: number,
+): Promise<WAMessageMedia> {
+  const response = await fetch(url, { signal: AbortSignal.timeout(URL_TIMEOUT_MS) });
+  if (!response.ok || !response.body) {
+    throw new ValidationError("wwebjs", `Could not fetch ${url}: HTTP ${response.status}.`);
+  }
+  const data = await collect(response.body, maxBytes, url);
+  const name = source.name ?? new URL(url).pathname.split("/").pop() ?? null;
+  const mimeType =
+    source.mimeType ??
+    response.headers.get("content-type")?.split(";")[0] ??
+    mimeTypeOf(name ?? undefined);
+  return new MessageMedia(mimeType, data.toString("base64"), name);
+}
+
+/** Reads at most `maxBytes`, stopping the stream rather than buffering the rest. */
+async function collect(
+  stream: AsyncIterable<Uint8Array>,
+  maxBytes: number,
+  label: string,
+): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of stream) {
+    total += chunk.length;
+    if (total > maxBytes) throw tooLarge(label, total, maxBytes);
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+function tooLarge(label: string, size: number, maxBytes: number): ValidationError {
+  return new ValidationError(
+    "wwebjs",
+    `Media for ${label} is ${size} bytes or more, over the ${maxBytes}-byte limit.`,
+  );
+}
+
+function unavailable(messageId: string): ValidationError {
+  return new ValidationError(
+    "wwebjs",
+    `Media for message ${messageId} is no longer available for download.`,
+  );
 }
 
 async function toBase64(data: ArrayBuffer | Blob | Buffer): Promise<string> {
