@@ -82,4 +82,17 @@ describe("WWebJSFormatConverter", () => {
     expect(Date.now() - started).toBeLessThan(200);
     expect(ast.type).toBe("root");
   });
+
+  it("prints a bare URL or address once", () => {
+    const converter = new WWebJSFormatConverter();
+    expect(converter.renderPostable({ markdown: "Visit https://example.com now" })).toBe(
+      "Visit https://example.com now",
+    );
+    expect(converter.renderPostable({ markdown: "Write to foo@bar.com" })).toBe(
+      "Write to foo@bar.com",
+    );
+    expect(converter.renderPostable({ markdown: "[docs](https://example.com)" })).toBe(
+      "docs (https://example.com)",
+    );
+  });
 });

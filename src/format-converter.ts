@@ -61,8 +61,13 @@ export class WWebJSFormatConverter extends BaseFormatConverter {
         return node.url || this.join(node);
       case "inlineCode":
         return `\`${node.value}\``;
-      case "link":
-        return node.url ? `${this.join(node)} (${node.url})` : this.join(node);
+      case "link": {
+        const text = this.join(node);
+        // A bare URL or address is its own link; repeating it would print it twice.
+        return !node.url || [text, `mailto:${text}`].includes(node.url)
+          ? text
+          : `${text} (${node.url})`;
+      }
       case "list":
         return this.renderList(node, 0, (child) => this.toWhatsApp(child));
       case "strong":

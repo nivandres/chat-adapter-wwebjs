@@ -407,7 +407,28 @@ describe("WWebJSAdapter", () => {
       );
       const result = await adapter.fetchMessages(THREAD, { limit: 3 });
       expect(result.messages.map((message) => message.text)).toEqual(["m7", "m8", "m9"]);
-      expect(result.nextCursor).toBe("3");
+      expect(result.nextCursor).toBe(`3|false_${ALICE}_M7`);
+    });
+
+    it("repeats nothing across backward pages when a message arrives in between", async () => {
+      const history = ["m1", "m2", "m3", "m4", "m5", "m6", "m7"].map((body) =>
+        waMessage({ body, messageId: body }),
+      );
+      const { adapter } = await connected(
+        {},
+        {
+          getChatById: vi.fn(async () =>
+            waChat({
+              fetchMessages: vi.fn(async ({ limit }: { limit: number }) => history.slice(-limit)),
+            }),
+          ),
+        },
+      );
+      const first = await adapter.fetchMessages(THREAD, { limit: 3 });
+      history.push(waMessage({ body: "m8", messageId: "m8" }));
+      const second = await adapter.fetchMessages(THREAD, { cursor: first.nextCursor, limit: 3 });
+
+      expect(second.messages.map((message) => message.text)).toEqual(["m2", "m3", "m4"]);
     });
 
     it("walks backward through history with the cursor", async () => {
@@ -417,7 +438,7 @@ describe("WWebJSAdapter", () => {
       );
       const page = await adapter.fetchMessages(THREAD, { cursor: "3", limit: 3 });
       expect(page.messages.map((message) => message.text)).toEqual(["m4", "m5", "m6"]);
-      expect(page.nextCursor).toBe("6");
+      expect(page.nextCursor).toBe(`6|false_${ALICE}_M4`);
     });
 
     it("stops when the history runs out", async () => {
@@ -537,6 +558,14 @@ describe("WWebJSAdapter", () => {
         userId: ALICE,
         userName: "alice",
       });
+    });
+
+    it("opens one DM for a phone number and its @c.us id", async () => {
+      const { adapter } = await connected(
+        {},
+        { getNumberId: vi.fn(async () => ({ _serialized: "99990000111122@lid" })) },
+      );
+      expect(await adapter.openDM(ALICE)).toBe(await adapter.openDM("15551234567"));
     });
 
     it("resolves a phone number into a DM thread", async () => {
@@ -707,6 +736,50 @@ describe("WWebJSAdapter", () => {
       expect(message.text).toBe("@$'$'$& tail");
     });
 
+    it("names mentions whose ids share a prefix, each by its own name", async () => {
+      const names: Record<string, string> = {
+        "11111111111111@lid": "Bob",
+        "111111111111111@lid": "Carol",
+      };
+      const { chat, client } = await connected(
+        {},
+        { getContactById: vi.fn(async (id: string) => ({ pushname: names[id] })) },
+      );
+      client.emit(
+        "message_create",
+        waMessage({
+          body: "@11111111111111 and @111111111111111",
+          mentionedIds: Object.keys(names),
+          remote: GROUP,
+        }),
+      );
+      await flush();
+
+      const message = await chat.processMessage.mock.calls[0]![2]();
+      expect(message.text).toBe("@Bob and @Carol");
+    });
+
+    it("still delivers a message whose mentioned contact never resolves", async () => {
+      vi.useFakeTimers();
+      try {
+        const { chat, client } = await connected(
+          {},
+          { getContactById: vi.fn(() => new Promise(() => {})) },
+        );
+        client.emit(
+          "message_create",
+          waMessage({ body: "@2222 hi", mentionedIds: ["2222@lid"], remote: GROUP }),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        const parsed = chat.processMessage.mock.calls[0]![2]();
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        await expect(parsed).resolves.toMatchObject({ text: "@2222 hi" });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("looks up a bounded number of mentioned contacts", async () => {
       const getContactById = vi.fn(async () => null);
       const { chat, client } = await connected({}, { getContactById });
@@ -776,6 +849,22 @@ describe("WWebJSAdapter", () => {
       expect(event.threadId).toBe(THREAD);
       expect((await event.message()).text).toBe("after");
       expect((await event.previousMessage()).text).toBe("before");
+    });
+
+    it("reports the original id of a message revoked under a $1-only key", async () => {
+      const { chat, client } = await connected();
+      const key = { $1: `false_${ALICE}_ORIG`, fromMe: false, id: "ORIG", remote: ALICE };
+      const original = waMessage({ body: "secret", messageId: "STUB" });
+      (original as { id: unknown }).id = { ...key };
+      client.emit(
+        "message_revoke_everyone",
+        waMessage({ messageId: "STUB", protocolMessageKey: key, type: "revoked" }),
+        original,
+      );
+
+      const event = chat.processMessageDeleted.mock.calls[0]![0];
+      expect(event.messageId).toBe(`false_${ALICE}_ORIG`);
+      expect(event.previousMessage.id).toBe(`false_${ALICE}_ORIG`);
     });
 
     it("reports a revoked message with its previous content", async () => {

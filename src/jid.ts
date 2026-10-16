@@ -54,8 +54,9 @@ export function extractMentions(text: string): { mentions: string[]; text: strin
     mentions.add(chatId);
     return `@${toUser(chatId)}`;
   });
+  const named = new Set([...mentions].map(toUser));
   for (const [, user] of rendered.matchAll(/@(\d{6,})\b/g)) {
-    mentions.add(`${user}${USER_SUFFIX}`);
+    if (user && !named.has(user)) mentions.add(`${user}${USER_SUFFIX}`);
   }
   return { mentions: [...mentions], text: rendered };
 }

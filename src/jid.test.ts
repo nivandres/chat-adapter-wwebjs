@@ -58,4 +58,8 @@ describe("jid", () => {
     extractMentions("<@".repeat(32_000));
     expect(Date.now() - started).toBeLessThan(50);
   });
+
+  it("mentions a LID once, without inventing a phone id for it", () => {
+    expect(extractMentions("<@99990000111122@lid> hi").mentions).toEqual(["99990000111122@lid"]);
+  });
 });

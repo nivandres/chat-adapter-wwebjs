@@ -13,4 +13,8 @@ Initial release, tested against live WhatsApp in DMs and groups through `chat-ad
 - Inbound text from anyone is safe to handle: a failing handler is logged rather than ending the process, mention names stay literal, contact lookups per message are capped, and markdown too long or too deep for the parser stays plain.
 - WhatsApp extras: polls with decrypted votes, locations, scheduled events, stickers, forwarding, pinning, starring, message search, group participants, presence, and chat state.
 - `sendEvent` attaches no call link unless `callType` asks for one.
+- One DM thread per person: `openDM` resolves a number and its `@c.us` id alike, to the chat WhatsApp uses — often a LID.
+- Deleted messages keep their own id, and history cursors stay put when messages arrive between pages.
+- A bare URL or address is printed once, not followed by itself in parentheses.
+- A contact or quoted message WhatsApp never returns holds a message back at most 5 seconds.
 - `adapter.client` exposes the underlying whatsapp-web.js client.

@@ -105,6 +105,8 @@ const DEFAULT_LIMIT = 50;
 const MAX_HISTORY = 1000;
 /** Contact lookups per message, so a message listing hundreds of mentions cannot queue hundreds of them. */
 const MAX_MENTION_LOOKUPS = 20;
+/** A contact or quoted message WhatsApp never returns must not hold the message back. */
+const LOOKUP_TIMEOUT_MS = 5_000;
 const RECONNECT_MIN_MS = 5_000;
 const RECONNECT_MAX_MS = 300_000;
 const MAX_POLL_OPTIONS = 12;
@@ -241,7 +243,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       attachments: toAttachments(raw, this._config.maxMediaBytes),
       author: this._author(raw),
       formatted: this._converter.toAst(text),
-      id: raw.id._serialized,
+      id: serialize(raw.id),
       isMention: this._mentionsBot(raw),
       links: (raw.links ?? []).map(({ link }) => ({ url: link })),
       metadata: {
@@ -376,9 +378,12 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     };
   }
 
+  /** A number, or its `@c.us` id, resolves to the chat WhatsApp uses for it — often a LID — so a DM is one thread whoever opened it. */
   async openDM(userId: string): Promise<string> {
-    if (userId.includes("@")) return this.encodeThreadId({ chatId: userId });
-    const resolved = await this.client.getNumberId(userId).catch(() => null);
+    if (userId.includes("@") && !userId.endsWith("@c.us")) {
+      return this.encodeThreadId({ chatId: userId });
+    }
+    const resolved = await this.client.getNumberId(toUser(userId)).catch(() => null);
     return this.encodeThreadId({ chatId: resolved?._serialized ?? toChatId(userId) });
   }
 
@@ -710,8 +715,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       adapter: this,
       channelId: threadId,
       deletedAt: new Date(raw.timestamp * 1000),
-      messageId:
-        revoked?.id._serialized ?? raw.protocolMessageKey?._serialized ?? raw.id._serialized,
+      messageId: serialize(revoked?.id) || serialize(raw.protocolMessageKey) || raw.id._serialized,
       previousMessage: revoked ? this.parseMessage(revoked) : undefined,
       raw,
       threadId,
@@ -815,7 +819,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     if (others.length > 0) {
       const names = new Map<string, string>();
       for (const id of others) {
-        const contact = await this.client.getContactById(id).catch(() => null);
+        const contact = await within(this.client.getContactById(id));
         const name = contact?.pushname || contact?.name;
         if (name) names.set(toUser(id), name);
       }
@@ -823,7 +827,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       parsed.formatted = this._converter.toAst(parsed.text);
     }
     if (raw.hasQuotedMsg) {
-      const quoted = await raw.getQuotedMessage().catch(() => null);
+      const quoted = await within(raw.getQuotedMessage());
       if (quoted) parsed.replyTo = this.parseMessage(quoted);
       if (quoted?.fromMe) parsed.isMention = true;
     }
@@ -875,10 +879,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
   /** WhatsApp writes a mention as `@` and the number or LID; readers expect the name. */
   private _named(text: string, users: string[], name: (user: string) => string): string {
-    // A replacer function, so a name the sender chose cannot carry `$'` or `$&` patterns.
-    return users.reduce(
-      (named, user) => named.replaceAll(`@${user}`, () => `@${name(user)}`),
-      text,
+    // Whole ids only, so `@123` never renames the start of `@1234`; a replacer, so a name cannot carry `$'`.
+    return text.replace(/@(\d+)(?!\d)/g, (mention, user: string) =>
+      users.includes(user) ? `@${name(user)}` : mention,
     );
   }
 
@@ -986,22 +989,39 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
   private async _page(chat: WAChat, options?: FetchOptions): Promise<FetchResult<WAMessage>> {
     const limit = Math.min(MAX_HISTORY, Math.max(1, options?.limit ?? DEFAULT_LIMIT));
-    const offset = Math.min(MAX_HISTORY, Math.max(0, Number(options?.cursor ?? 0) || 0));
+    // Backward cursors carry the oldest id they returned, so a message arriving between pages shifts nothing.
+    const [count, before] = (options?.cursor ?? "").split("|");
+    const offset = Math.min(MAX_HISTORY, Math.max(0, Number(count) || 0));
     const forward = options?.direction === "forward";
 
-    const window = await chat.fetchMessages({
-      limit: forward ? MAX_HISTORY : Math.min(MAX_HISTORY, offset + limit),
-    });
-    const start = forward ? offset : Math.max(0, window.length - offset - limit);
-    const end = forward ? Math.min(window.length, offset + limit) : window.length - offset;
+    const anchorIn = (messages: WAMessage[]) =>
+      before ? messages.findIndex((message) => serialize(message.id) === before) : -1;
+    let size = forward ? MAX_HISTORY : Math.min(MAX_HISTORY, offset + limit);
+    let window = await chat.fetchMessages({ limit: size });
+    let anchor = anchorIn(window);
+    // Messages arriving since the last page push the anchor back; widen until a full page fits before it.
+    while (before && !forward && anchor < limit && window.length === size && size < MAX_HISTORY) {
+      size = Math.min(MAX_HISTORY, size + limit);
+      window = await chat.fetchMessages({ limit: size });
+      anchor = anchorIn(window);
+    }
+    const end = forward
+      ? Math.min(window.length, offset + limit)
+      : anchor >= 0
+        ? anchor
+        : window.length - offset;
+    const start = forward ? offset : Math.max(0, end - limit);
     const page = end > start ? window.slice(start, end) : [];
-    const exhausted = forward
-      ? offset + page.length >= window.length
-      : window.length < offset + limit;
+    const exhausted = forward ? end >= window.length : start === 0 && window.length < size;
 
     return {
       messages: page.map((message) => this.parseMessage(message)),
-      nextCursor: exhausted || page.length === 0 ? undefined : String(offset + page.length),
+      nextCursor:
+        exhausted || page.length === 0
+          ? undefined
+          : forward
+            ? String(end)
+            : `${window.length - start}|${serialize(page[0]!.id)}`,
     };
   }
 
@@ -1034,6 +1054,13 @@ export function createWWebJSAdapter(config: WWebJSAdapterConfig = {}): WWebJSAda
 
 function chatIdOf(message: WAMessage): string {
   return message.id?.remote || (message.fromMe ? message.to : message.from);
+}
+
+function within<T>(lookup: Promise<T>): Promise<T | null> {
+  return Promise.race([
+    lookup.catch(() => null),
+    new Promise<null>((resolve) => setTimeout(resolve, LOOKUP_TIMEOUT_MS, null).unref?.()),
+  ]);
 }
 
 function isGroupChat(chat: WAChat | null): chat is GroupChat {
