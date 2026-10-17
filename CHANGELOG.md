@@ -1,5 +1,11 @@
 # chat-adapter-wwebjs
 
+## 0.1.1
+
+### Fixed
+
+- `connectTimeoutMs` also counted the wait for a QR scan, so a first pairing gave up after 2 minutes and the QR on screen stopped working. Once a QR or pairing code is shown, the connection waits on the person scanning it.
+
 ## 0.1.0
 
 Initial release, tested against live WhatsApp in DMs and groups through `chat-adapter-remote`.

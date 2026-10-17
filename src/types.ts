@@ -41,8 +41,9 @@ export interface WWebJSAdapterConfig {
 
   /**
    * How long opening the session may take before it is abandoned — and, with
-   * `reconnect`, tried again. whatsapp-web.js itself never gives up. Defaults
-   * to 2 minutes.
+   * `reconnect`, tried again. whatsapp-web.js itself never gives up. Once a QR
+   * or pairing code is shown it waits on a person instead, without limit.
+   * Defaults to 2 minutes.
    */
   connectTimeoutMs?: number;
 

@@ -660,6 +660,10 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       );
       timer.unref?.();
     });
+    // A QR or pairing code means the session is up and waiting on a person, which no timeout should cut short.
+    const waiting = () => clearTimeout(timer);
+    this.client.once("qr", waiting);
+    this.client.once("code", waiting);
     try {
       await Promise.race([this._open(), timedOut]);
     } catch (error) {
@@ -668,6 +672,8 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       throw error;
     } finally {
       clearTimeout(timer);
+      this.client.off("qr", waiting);
+      this.client.off("code", waiting);
     }
   }
 

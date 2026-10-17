@@ -1381,6 +1381,18 @@ describe("WWebJSAdapter", () => {
         expect(adapter.connection).toBe("disconnected");
       });
 
+      it("waits as long as it takes for a person to scan the QR", async () => {
+        const { adapter, client } = await connected({ connectTimeoutMs: 10_000, reconnect: false });
+        const attempt = adapter.connect();
+        await vi.advanceTimersByTimeAsync(1_000);
+        client.emit("qr", "scan me");
+        await vi.advanceTimersByTimeAsync(600_000);
+        client.emit("ready");
+
+        await expect(attempt).resolves.toBeUndefined();
+        expect(adapter.connection).toBe("connected");
+      });
+
       it("reopens a session WhatsApp stopped answering, which no event reported", async () => {
         const { adapter, client } = await connected({ watchdogIntervalMs: 30_000 });
         const first = adapter.connect();

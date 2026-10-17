@@ -70,22 +70,22 @@ None. This adapter takes no credentials from the environment — a WhatsApp Web 
 
 ## Configuration
 
-| Field                | Type                        | Default         | Description                                                                                                                          |
-| -------------------- | --------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `adapterName`        | `string`                    | `"wwebjs"`      | Adapter identity and thread-ID prefix. Must match the key it is registered under in `Chat`, and must not contain `:`.                |
-| `client`             | `Client`                    | —               | An existing whatsapp-web.js client to drive. When omitted, one is built from `clientOptions`.                                        |
-| `clientOptions`      | `ClientOptions`             | `{}`            | Options for the client the adapter builds — `authStrategy`, `puppeteer`, `webVersionCache`, and so on. Ignored when `client` is set. |
-| `connectTimeoutMs`   | `number`                    | 2 minutes       | How long opening the session may take before it is abandoned and, with `reconnect`, tried again.                                     |
-| `logger`             | `Logger`                    | `ConsoleLogger` | Logger used until `Chat` hands over its own.                                                                                         |
-| `markSeen`           | `boolean`                   | `false`         | Send a read receipt for every inbound message as it arrives.                                                                         |
-| `maxMediaBytes`      | `number`                    | 64 MB           | Largest media read into memory, inbound or fetched from a `url`. Bytes are counted as they arrive, whatever size the sender claims.  |
-| `onPairingCode`      | `(code: string) => unknown` | —               | Receives the 8-character pairing code when `phoneNumber` is set.                                                                     |
-| `onQR`               | `(qr: string) => unknown`   | —               | Receives the QR string during login. Render it with `qrcode-terminal` or similar.                                                    |
-| `phoneNumber`        | `string`                    | —               | Log in with a pairing code instead of a QR. E.164 without the leading `+`.                                                           |
-| `receiveOwnMessages` | `boolean`                   | `false`         | Pass what the paired account did — its messages, edits, deletes and reactions — to the Chat SDK, which still skips most of its own.  |
-| `reconnect`          | `boolean`                   | `true`          | Open the session again when WhatsApp drops it, backing off from 5 seconds to 5 minutes. A logout is never retried.                   |
-| `watchdogIntervalMs` | `number \| false`           | 1 minute        | How often a connected session is asked whether WhatsApp still answers; two failed checks count as a disconnect.                      |
-| `userName`           | `string`                    | `"wwebjs-bot"`  | Bot display name. When unset, the account's WhatsApp push name is adopted once the session is ready.                                 |
+| Field                | Type                        | Default         | Description                                                                                                                                                 |
+| -------------------- | --------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `adapterName`        | `string`                    | `"wwebjs"`      | Adapter identity and thread-ID prefix. Must match the key it is registered under in `Chat`, and must not contain `:`.                                       |
+| `client`             | `Client`                    | —               | An existing whatsapp-web.js client to drive. When omitted, one is built from `clientOptions`.                                                               |
+| `clientOptions`      | `ClientOptions`             | `{}`            | Options for the client the adapter builds — `authStrategy`, `puppeteer`, `webVersionCache`, and so on. Ignored when `client` is set.                        |
+| `connectTimeoutMs`   | `number`                    | 2 minutes       | How long opening the session may take before it is abandoned and, with `reconnect`, tried again. Once a QR or pairing code is shown, it waits for the scan. |
+| `logger`             | `Logger`                    | `ConsoleLogger` | Logger used until `Chat` hands over its own.                                                                                                                |
+| `markSeen`           | `boolean`                   | `false`         | Send a read receipt for every inbound message as it arrives.                                                                                                |
+| `maxMediaBytes`      | `number`                    | 64 MB           | Largest media read into memory, inbound or fetched from a `url`. Bytes are counted as they arrive, whatever size the sender claims.                         |
+| `onPairingCode`      | `(code: string) => unknown` | —               | Receives the 8-character pairing code when `phoneNumber` is set.                                                                                            |
+| `onQR`               | `(qr: string) => unknown`   | —               | Receives the QR string during login. Render it with `qrcode-terminal` or similar.                                                                           |
+| `phoneNumber`        | `string`                    | —               | Log in with a pairing code instead of a QR. E.164 without the leading `+`.                                                                                  |
+| `receiveOwnMessages` | `boolean`                   | `false`         | Pass what the paired account did — its messages, edits, deletes and reactions — to the Chat SDK, which still skips most of its own.                         |
+| `reconnect`          | `boolean`                   | `true`          | Open the session again when WhatsApp drops it, backing off from 5 seconds to 5 minutes. A logout is never retried.                                          |
+| `watchdogIntervalMs` | `number \| false`           | 1 minute        | How often a connected session is asked whether WhatsApp still answers; two failed checks count as a disconnect.                                             |
+| `userName`           | `string`                    | `"wwebjs-bot"`  | Bot display name. When unset, the account's WhatsApp push name is adopted once the session is ready.                                                        |
 
 ## Platform setup
 
