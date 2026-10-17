@@ -108,6 +108,10 @@ const MAX_HISTORY = 1000;
 const MAX_MENTION_LOOKUPS = 20;
 /** A contact or quoted message WhatsApp never returns must not hold the message back. */
 const LOOKUP_TIMEOUT_MS = 5_000;
+/** WhatsApp refuses to edit a message for a few hundred milliseconds after sending it. */
+const EDIT_RETRIES = 3;
+const EDIT_RETRY_MS = 250;
+const FRESH_MS = 5_000;
 const CONNECT_TIMEOUT_MS = 120_000;
 const WATCHDOG_INTERVAL_MS = 60_000;
 const RECONNECT_MIN_MS = 5_000;
@@ -305,7 +309,13 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   ): Promise<RawMessage<WAMessage>> {
     const { mentions, text } = extractMentions(this._render(message));
     const target = await this._requireMessage(messageId);
-    const edited = await target.edit(text, mentions.length > 0 ? { mentions } : undefined);
+    const edit = () => target.edit(text, mentions.length > 0 ? { mentions } : undefined);
+    let edited = await edit();
+    const fresh = target.fromMe && Date.now() - target.timestamp * 1000 < FRESH_MS;
+    for (let retry = 0; !edited && fresh && retry < EDIT_RETRIES; retry++) {
+      await new Promise((resolve) => setTimeout(resolve, EDIT_RETRY_MS));
+      edited = await edit();
+    }
     if (!edited) {
       throw new ValidationError(
         "wwebjs",

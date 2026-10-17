@@ -350,6 +350,31 @@ describe("WWebJSAdapter", () => {
       expect(result.id).toBe(`true_${ALICE}_EDITED`);
     });
 
+    it("edits a message it has only just sent, once WhatsApp accepts it", async () => {
+      vi.useFakeTimers();
+      try {
+        const edit = vi
+          .fn()
+          .mockResolvedValueOnce(null)
+          .mockResolvedValue(waMessage({ fromMe: true, messageId: "SENT" }));
+        const { adapter } = await connected(
+          {},
+          {
+            getMessageById: vi.fn(async () =>
+              waMessage({ edit, fromMe: true, timestamp: Math.floor(Date.now() / 1000) }),
+            ),
+          },
+        );
+        const edited = adapter.editMessage(THREAD, "SENT", "new");
+        await vi.advanceTimersByTimeAsync(250);
+
+        await expect(edited).resolves.toMatchObject({ threadId: THREAD });
+        expect(edit).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("explains why an edit was refused", async () => {
       const { adapter } = await connected(
         {},

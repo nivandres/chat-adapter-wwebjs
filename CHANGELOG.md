@@ -17,5 +17,6 @@ Initial release, tested against live WhatsApp in DMs and groups through `chat-ad
 - One DM thread per person: `openDM` resolves a number and its `@c.us` id alike, to the chat WhatsApp uses — often a LID.
 - Deleted messages keep their own id, and history cursors stay put when messages arrive between pages.
 - A bare URL or address is printed once, not followed by itself in parentheses.
+- A message can be edited right after it is sent: WhatsApp refuses for a few hundred milliseconds, so a fresh message of the bot's own is retried briefly.
 - A contact or quoted message WhatsApp never returns holds a message back at most 5 seconds.
 - `adapter.client` exposes the underlying whatsapp-web.js client.
