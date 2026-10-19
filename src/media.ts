@@ -134,7 +134,11 @@ export async function toMedia(
 
 /** WhatsApp renders a caption on every media kind except audio. */
 export function isCaptionable(media: WAMessageMedia): boolean {
-  return !media.mimetype.startsWith("audio/");
+  return !isAudio(media);
+}
+
+export function isAudio(media: WAMessageMedia): boolean {
+  return media.mimetype.startsWith("audio/");
 }
 
 function mimeTypeOf(filename?: string): string {

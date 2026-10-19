@@ -1,4 +1,4 @@
-import type { Author, Logger } from "chat";
+import type { Author, CardElement, ChatInstance, Logger, Message } from "chat";
 import type {
   Call,
   Client,
@@ -7,6 +7,7 @@ import type {
   Message as WAMessage,
   PollVote,
 } from "whatsapp-web.js";
+import type { WWebJSAdapter } from "./adapter.js";
 
 /**
  * Where the WhatsApp session stands. Only `connected` can send and receive;
@@ -30,13 +31,27 @@ export interface WWebJSAdapterConfig {
    */
   adapterName?: string;
 
+  /** Layers that change how cards are sent or messages received; see `numberedActions()`. */
+  addons?: WWebJSAddon[];
+
+  /**
+   * Messages that arrived while the session was down are delivered once it is
+   * back, up to this old, in order and each once. Defaults to 1 day; `false`
+   * turns it off.
+   */
+  catchUpMs?: number | false;
+
   /**
    * An existing whatsapp-web.js client to drive. When omitted the adapter
    * constructs one from {@link WWebJSAdapterConfig.clientOptions}.
    */
   client?: Client;
 
-  /** Options for the client the adapter constructs. Ignored when `client` is set. */
+  /**
+   * Options for the client the adapter constructs, Puppeteer's included.
+   * `puppeteer.args` are added after {@link RECOMMENDED_CHROMIUM_ARGS}, so a
+   * flag given here wins. Ignored when `client` is set.
+   */
   clientOptions?: ClientOptions;
 
   /**
@@ -46,6 +61,14 @@ export interface WWebJSAdapterConfig {
    * Defaults to 2 minutes.
    */
   connectTimeoutMs?: number;
+
+  /**
+   * Close the session on SIGINT, SIGTERM and SIGHUP, then let the signal end
+   * the process as it otherwise would — unless the app listens for it, and
+   * shuts down itself. Puppeteer alone closes the browser and leaves the
+   * process running. Defaults to `true`.
+   */
+  handleSignals?: boolean;
 
   /** Logger instance. Replaced by the Chat SDK logger once initialized. */
   logger?: Logger;
@@ -88,6 +111,12 @@ export interface WWebJSAdapterConfig {
   receiveOwnMessages?: boolean;
 
   /**
+   * Start Chromium with {@link RECOMMENDED_CHROMIUM_ARGS}, which keep it lean
+   * and steady in a container. Defaults to `true`.
+   */
+  recommendedArgs?: boolean;
+
+  /**
    * Open the session again when WhatsApp drops it, waiting longer after each
    * failed attempt. A logout is never retried, since it needs a new pairing.
    * Defaults to `true`.
@@ -104,6 +133,30 @@ export interface WWebJSAdapterConfig {
 
   /** Bot display name. Defaults to `"wwebjs-bot"`. */
   userName?: string;
+
+  /**
+   * Send audio as a voice note, played inline with a waveform, rather than as
+   * a file. Defaults to `true`.
+   */
+  voiceNotes?: boolean;
+}
+
+/** What an addon is handed alongside each card or message. */
+export interface WWebJSAddonContext {
+  adapter: WWebJSAdapter;
+  /** Absent until the Chat SDK has initialized the adapter. */
+  chat: ChatInstance | null;
+  threadId: string;
+}
+
+/** A layer over the adapter; every hook is optional. */
+export interface WWebJSAddon {
+  /** Text for a card in place of its plain fallback; the first addon to answer wins. */
+  renderCard?(card: CardElement, context: WWebJSAddonContext): string | undefined;
+  /** Called once a card is on WhatsApp, with the id of the message carrying it. */
+  cardSent?(card: CardElement, messageId: string, context: WWebJSAddonContext): unknown;
+  /** Return `true` to keep an inbound message from reaching the Chat SDK as one. */
+  onMessage?(message: Message<WAMessage>, context: WWebJSAddonContext): boolean | Promise<boolean>;
 }
 
 /** Delivery state of a sent message, reported by {@link WWebJSAdapter.onAck}. */

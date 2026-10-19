@@ -1,9 +1,27 @@
-import { ConsoleLogger, type ChatInstance, type Message } from "chat";
+import { createMemoryState } from "@chat-adapter/state-memory";
+import {
+  Actions,
+  Button,
+  Card,
+  ConsoleLogger,
+  LinkButton,
+  Select,
+  SelectOption,
+  type ChatInstance,
+  type Message,
+  type StateAdapter,
+} from "chat";
 import { EventEmitter } from "node:events";
 import type { MessageSendOptions } from "whatsapp-web.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createWWebJSAdapter, WWebJSAdapter } from "./adapter";
+import { createWWebJSAdapter, RECOMMENDED_CHROMIUM_ARGS, WWebJSAdapter } from "./adapter";
 import { isWWebJSAdapter, requireWWebJSAdapter } from "./guards";
+import { numberedActions } from "./numbered-actions";
+import { closeOnSignal } from "./shutdown";
+
+const unsignal = vi.fn();
+vi.mock("./shutdown", () => ({ closeOnSignal: vi.fn(() => unsignal) }));
+beforeEach(() => vi.clearAllMocks());
 
 const BOT = "15550000000@c.us";
 const ALICE = "15551234567@c.us";
@@ -85,9 +103,12 @@ function fakeClient(overrides: Record<string, unknown> = {}) {
   });
 }
 
-function fakeChatInstance() {
+function fakeChatInstance(state: StateAdapter = createMemoryState()) {
+  void state.connect();
   return {
     getLogger: () => new ConsoleLogger("error"),
+    getState: () => state,
+    processAction: vi.fn(),
     processMemberJoinedChannel: vi.fn(),
     processMessage: vi.fn(),
     processMessageDeleted: vi.fn(),
@@ -316,6 +337,29 @@ describe("WWebJSAdapter", () => {
       expect(client.sendMessage).toHaveBeenCalledTimes(2);
       expect(client.sendMessage.mock.calls[0]![1]).toBe("listen");
       expect(client.sendMessage.mock.calls[1]![1]).toMatchObject({ mimetype: "audio/ogg" });
+    });
+
+    it("sends audio as a voice note", async () => {
+      const { adapter, client } = await connected();
+      await adapter.postMessage(THREAD, {
+        files: [{ data: Buffer.from("x"), filename: "reply.ogg" }],
+        raw: "",
+      });
+      expect(client.sendMessage.mock.calls[0]![2]).toMatchObject({ sendAudioAsVoice: true });
+    });
+
+    it("sends audio as a file when voice notes are off, and other media never as voice", async () => {
+      const { adapter, client } = await connected({ voiceNotes: false });
+      await adapter.postMessage(THREAD, {
+        files: [
+          { data: Buffer.from("x"), filename: "song.mp3" },
+          { data: Buffer.from("y"), filename: "shot.png" },
+        ],
+        raw: "",
+      });
+      for (const [, , options] of client.sendMessage.mock.calls) {
+        expect(options!.sendAudioAsVoice).toBeUndefined();
+      }
     });
 
     it("quotes only the first message of a multi-part send", async () => {
@@ -1455,6 +1499,228 @@ describe("WWebJSAdapter", () => {
       const response = await adapter.handleWebhook(new Request("https://example.com"));
       expect(response.status).toBe(501);
       expect(await response.json()).toMatchObject({ error: expect.stringContaining("connect()") });
+    });
+  });
+
+  describe("catching up after the session was down", () => {
+    const T = 1_700_000_000;
+    const seenKey = "wwebjs:wwebjs:seen";
+
+    async function readyWith(
+      seen: { at: number; ids: string[] } | undefined,
+      messages: unknown[],
+      config: Record<string, unknown> = {},
+    ) {
+      const state = createMemoryState();
+      await state.connect();
+      if (seen) await state.set(seenKey, seen);
+      const chat = fakeChatInstance(state);
+      const fetchMessages = vi.fn(async () => messages);
+      const client = fakeClient({
+        getChats: vi.fn(async () => [
+          waChat({ fetchMessages, timestamp: Math.floor(Date.now() / 1000) }),
+        ]),
+      });
+      const adapter = createWWebJSAdapter({ client: client as never, ...config });
+      await adapter.initialize(chat as unknown as ChatInstance);
+      client.emit("ready");
+      await vi.waitFor(() => expect(state.get(seenKey)).resolves.toBeTruthy());
+      await flush();
+      await flush();
+      const delivered = async () =>
+        Promise.all(
+          chat.processMessage.mock.calls.map(
+            async ([, , message]) => (await (message as () => Promise<Message>)()).text,
+          ),
+        );
+      return { adapter, chat, client, delivered, state };
+    }
+
+    it("delivers what arrived since the last message, in order and each once", async () => {
+      const { delivered } = await readyWith(
+        { at: T, ids: [`false_${ALICE}_A`] },
+        [
+          waMessage({ body: "already seen", messageId: "A", timestamp: T }),
+          waMessage({ body: "same second", messageId: "B", timestamp: T }),
+          waMessage({ body: "later", messageId: "C", timestamp: T + 5 }),
+          waMessage({ body: "mine", fromMe: true, messageId: "D", timestamp: T + 6 }),
+        ],
+        { catchUpMs: Number.MAX_SAFE_INTEGER },
+      );
+
+      await vi.waitFor(async () => expect(await delivered()).toEqual(["same second", "later"]));
+    });
+
+    it("starts counting on the first run, replaying nothing from before", async () => {
+      const { chat, client, state } = await readyWith(undefined, []);
+      expect(client.getChats).not.toHaveBeenCalled();
+      expect(chat.processMessage).not.toHaveBeenCalled();
+      expect(await state.get(seenKey)).toMatchObject({ ids: [] });
+    });
+
+    it("records each message delivered, so the next restart starts after it", async () => {
+      const { client, state } = await readyWith({ at: T, ids: [] }, [], {
+        catchUpMs: Number.MAX_SAFE_INTEGER,
+      });
+      client.emit("message_create", waMessage({ body: "new", messageId: "N", timestamp: T + 99 }));
+      await vi.waitFor(async () =>
+        expect(await state.get(seenKey)).toEqual({ at: T + 99, ids: [`false_${ALICE}_N`] }),
+      );
+    });
+
+    it("skips what is older than catchUpMs, and everything when it is off", async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const old = await readyWith(
+        { at: now - 7200, ids: [] },
+        [
+          waMessage({ body: "too old", messageId: "O", timestamp: now - 3600 }),
+          waMessage({ body: "recent", messageId: "R", timestamp: now - 60 }),
+        ],
+        { catchUpMs: 1_800_000 },
+      );
+      await vi.waitFor(async () => expect(await old.delivered()).toEqual(["recent"]));
+
+      const state = createMemoryState();
+      await state.connect();
+      const client = fakeClient({ getChats: vi.fn(async () => []) });
+      const adapter = createWWebJSAdapter({ catchUpMs: false, client: client as never });
+      await adapter.initialize(fakeChatInstance(state) as unknown as ChatInstance);
+      client.emit("ready");
+      await flush();
+      expect(client.getChats).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("process signals and Chromium", () => {
+    it("closes its session on a signal while connected, and stops listening once closed", async () => {
+      const { adapter, client } = await connected();
+      void adapter.connect();
+      expect(closeOnSignal).toHaveBeenCalledOnce();
+      await vi.mocked(closeOnSignal).mock.calls[0]![0]();
+      expect(client.destroy).toHaveBeenCalled();
+
+      void adapter.connect();
+      await adapter.disconnect();
+      expect(unsignal).toHaveBeenCalled();
+    });
+
+    it("leaves signals alone when told not to", async () => {
+      const { adapter } = await connected({ handleSignals: false });
+      void adapter.connect();
+      expect(closeOnSignal).not.toHaveBeenCalled();
+    });
+
+    it("starts Chromium with the recommended flags, its own after them, and Puppeteer's signal handling off", () => {
+      const adapter = createWWebJSAdapter({
+        clientOptions: { puppeteer: { args: ["--disable-gpu=false"], headless: true } },
+      });
+      const { puppeteer } = (
+        adapter.client as unknown as { options: { puppeteer: Record<string, unknown> } }
+      ).options;
+      expect(puppeteer).toMatchObject({
+        handleSIGHUP: false,
+        handleSIGINT: false,
+        handleSIGTERM: false,
+        headless: true,
+      });
+      expect(puppeteer.args).toEqual([...RECOMMENDED_CHROMIUM_ARGS, "--disable-gpu=false"]);
+    });
+
+    it("leaves Chromium's flags and Puppeteer's signals alone when asked", () => {
+      const adapter = createWWebJSAdapter({ handleSignals: false, recommendedArgs: false });
+      const { puppeteer } = (
+        adapter.client as unknown as { options: { puppeteer: Record<string, unknown> } }
+      ).options;
+      expect(puppeteer.args).toEqual([]);
+      expect(puppeteer.handleSIGTERM).toBeUndefined();
+    });
+  });
+
+  describe("numberedActions", () => {
+    const card = Card({
+      children: [
+        Actions([
+          Button({ id: "approve", label: "Approve", value: "yes" }),
+          Button({ disabled: true, id: "never", label: "Disabled" }),
+          LinkButton({ label: "Docs", url: "https://example.com/docs" }),
+          Select({
+            id: "size",
+            label: "Size",
+            options: [
+              SelectOption({ label: "Small", value: "s" }),
+              SelectOption({ label: "Large", value: "l" }),
+            ],
+          }),
+        ]),
+      ],
+      title: "Order",
+    });
+
+    async function withAddon(options = {}) {
+      const context = await connected({ addons: [numberedActions(options)] });
+      await context.adapter.postMessage(THREAD, card);
+      return context;
+    }
+
+    it("lists a card's buttons and select options by number, keeping links as links", async () => {
+      const { client } = await withAddon();
+      expect(client.sendMessage.mock.calls[0]![1]).toBe(
+        "*Order*\n\n1. Approve\nDocs: https://example.com/docs\n*Size*\n2. Small\n3. Large",
+      );
+    });
+
+    it("turns a reply with a number or a label into the card's action, not a message", async () => {
+      const { adapter, chat, client } = await withAddon();
+
+      client.emit("message_create", waMessage({ body: " 3 ", messageId: "R1" }));
+      client.emit("message_create", waMessage({ body: "approve", messageId: "R2" }));
+      await vi.waitFor(() => expect(chat.processAction).toHaveBeenCalledTimes(2));
+
+      expect(chat.processAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          actionId: "size",
+          adapter,
+          messageId: `true_${ALICE}_SENT`,
+          threadId: THREAD,
+          value: "l",
+        }),
+        undefined,
+      );
+      expect(chat.processAction).toHaveBeenCalledWith(
+        expect.objectContaining({ actionId: "approve", value: "yes" }),
+        undefined,
+      );
+      expect(chat.processMessage).not.toHaveBeenCalled();
+    });
+
+    it("delivers anything else as a message, and the pick too when asked", async () => {
+      const plain = await withAddon();
+      plain.client.emit("message_create", waMessage({ body: "9" }));
+      await vi.waitFor(() => expect(plain.chat.processMessage).toHaveBeenCalled());
+      expect(plain.chat.processAction).not.toHaveBeenCalled();
+
+      const kept = await withAddon({ keepMessage: true });
+      kept.client.emit("message_create", waMessage({ body: "1" }));
+      await vi.waitFor(() => expect(kept.chat.processMessage).toHaveBeenCalled());
+      expect(kept.chat.processAction).toHaveBeenCalled();
+    });
+
+    it("leaves a card without actions to the plain fallback", async () => {
+      const { adapter, client } = await connected({ addons: [numberedActions()] });
+      await adapter.postMessage(THREAD, Card({ title: "Just text" }));
+      expect(client.sendMessage.mock.calls[0]![1]).toBe("*Just text*");
+    });
+
+    it("never fails a send because the options could not be stored", async () => {
+      const state = createMemoryState();
+      vi.spyOn(state, "set").mockRejectedValue(new Error("redis down"));
+      const client = fakeClient();
+      const adapter = createWWebJSAdapter({ addons: [numberedActions()], client: client as never });
+      await adapter.initialize(fakeChatInstance(state) as unknown as ChatInstance);
+
+      await expect(adapter.postMessage(THREAD, card)).resolves.toMatchObject({
+        id: `true_${ALICE}_SENT`,
+      });
     });
   });
 

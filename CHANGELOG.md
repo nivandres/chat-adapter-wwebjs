@@ -1,5 +1,18 @@
 # chat-adapter-wwebjs
 
+## 0.1.2
+
+### Added
+
+- Messages that arrived while the session was down are delivered once it is back, in order and each once, up to `catchUpMs` old. WhatsApp Web loads them without firing an event, so they were lost.
+- Audio goes out as a voice note, played inline with a waveform; `voiceNotes: false` sends it as a file.
+- `numberedActions()` lists a card's buttons and select options by number, and a reply with one reaches `onAction`. WhatsApp Web cannot send buttons, so they used to vanish. It is the first of `addons`, layers with hooks for how cards are sent and messages received.
+- Chromium starts with `RECOMMENDED_CHROMIUM_ARGS` — one renderer process, no GPU, no component updates — before any `puppeteer.args` of your own; `recommendedArgs: false` leaves them out.
+
+### Fixed
+
+- A SIGTERM never ended the process: Puppeteer closed the browser and kept the process alive, and the adapter read the closed browser as a crash and opened a new one. Every session now closes on SIGINT, SIGTERM and SIGHUP, and the signal then ends the process unless the app handles it; `handleSignals: false` leaves signals alone.
+
 ## 0.1.1
 
 ### Fixed

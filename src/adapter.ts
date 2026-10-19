@@ -12,6 +12,7 @@ import {
   type AdapterPostableMessage,
   type Attachment,
   type Author,
+  type CardElement,
   type ChannelInfo,
   type ChannelVisibility,
   type ChatInstance,
@@ -49,12 +50,15 @@ import {
   toChatId,
   toUser,
 } from "./jid.js";
-import { download, isCaptionable, toAttachments, toMedia, toMediaList } from "./media.js";
+import { download, isAudio, isCaptionable, toAttachments, toMedia, toMediaList } from "./media.js";
+import { closeOnSignal } from "./shutdown.js";
 import type {
   WWebJSAck,
   WWebJSAckHandler,
   WWebJSAckStatus,
   WWebJSAdapterConfig,
+  WWebJSAddon,
+  WWebJSAddonContext,
   WWebJSCallHandler,
   WWebJSConnection,
   WWebJSGroupEvent,
@@ -118,10 +122,27 @@ const RECONNECT_MIN_MS = 5_000;
 const RECONNECT_MAX_MS = 300_000;
 const MAX_POLL_OPTIONS = 12;
 const MIN_POLL_OPTIONS = 2;
+const CATCH_UP_MS = 86_400_000;
+/** A session down for long must not flood the bot with every chat it has. */
+const MAX_CATCH_UP_CHATS = 100;
+const MAX_CATCH_UP_MESSAGES = 50;
+
+/** What a single WhatsApp Web tab can do without, on top of the flags Puppeteer already passes. */
+export const RECOMMENDED_CHROMIUM_ARGS = [
+  "--renderer-process-limit=1",
+  "--disable-gpu",
+  "--disable-component-update",
+];
 
 interface PollVoteSubscription {
   filter?: Set<string>;
   handler: WWebJSPollVoteHandler;
+}
+
+/** The newest inbound message delivered, and every one sharing its second, so a restart catches up on exactly what it missed. */
+interface Seen {
+  at: number;
+  ids: string[];
 }
 
 export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
@@ -149,6 +170,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   private _state: WWebJSConnection = "idle";
   private _watchdog?: ReturnType<typeof setInterval>;
   private _strikes = 0;
+  private _unsignal?: () => void;
+  private _seen?: Seen | null;
+  private _saving: Promise<unknown> = Promise.resolve();
 
   constructor(config: WWebJSAdapterConfig = {}) {
     const name = config.adapterName ?? "wwebjs";
@@ -195,6 +219,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     clearTimeout(this._retry);
     this._retry = undefined;
     this._watch();
+    if (this._config.handleSignals !== false) {
+      this._unsignal ??= closeOnSignal(() => this.disconnect());
+    }
     this._connection ??= this._connect().catch((error: unknown) => {
       this._connection = null;
       if (this._state !== "logged_out" && !this._closed) this._state = "disconnected";
@@ -211,6 +238,8 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     clearInterval(this._watchdog);
     this._watchdog = undefined;
     this._connection = null;
+    this._unsignal?.();
+    this._unsignal = undefined;
     await this.client.destroy();
   }
 
@@ -307,7 +336,8 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     messageId: string,
     message: AdapterPostableMessage,
   ): Promise<RawMessage<WAMessage>> {
-    const { mentions, text } = extractMentions(this._render(message));
+    const { card, text: rendered } = this._render(message, threadId);
+    const { mentions, text } = extractMentions(rendered);
     const target = await this._requireMessage(messageId);
     const edit = () => target.edit(text, mentions.length > 0 ? { mentions } : undefined);
     let edited = await edit();
@@ -322,7 +352,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
         `Message ${messageId} could not be edited. WhatsApp only allows editing your own messages within 15 minutes.`,
       );
     }
-    return this._raw(edited, threadId);
+    const raw = this._raw(edited, threadId);
+    await this._cardSent(card, raw.id, threadId);
+    return raw;
   }
 
   async deleteMessage(_threadId: string, messageId: string): Promise<void> {
@@ -640,6 +672,18 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
   private _clientOptions() {
     const options = { ...this._config.clientOptions };
+    const puppeteer = options.puppeteer ?? {};
+    options.puppeteer = {
+      // Puppeteer's handlers close the browser on a signal and keep the process alive; closeOnSignal does both.
+      ...(this._config.handleSignals === false
+        ? {}
+        : { handleSIGHUP: false, handleSIGINT: false, handleSIGTERM: false }),
+      ...puppeteer,
+      args: [
+        ...(this._config.recommendedArgs === false ? [] : RECOMMENDED_CHROMIUM_ARGS),
+        ...(puppeteer.args ?? []),
+      ],
+    };
     if (this._config.phoneNumber) {
       options.pairWithPhoneNumber = {
         phoneNumber: this._config.phoneNumber,
@@ -719,6 +763,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       }
       this._logger.info("WhatsApp session ready", { userId: this.botUserId });
       void this._learnLid();
+      this._guard("catch-up", this._catchUp());
     });
     this.client.on("disconnected", (reason) => this._onDisconnected(String(reason)));
     this.client.on("message_create", (message) => this._guard("message", this._onMessage(message)));
@@ -748,7 +793,76 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
         this._logger.warn("Failed to send a read receipt", { error, threadId }),
       );
     }
-    await this._chat.processMessage(this, threadId, () => this._parse(raw));
+    const parsed = this._addons("onMessage").length > 0 ? await this._parse(raw) : undefined;
+    if (!parsed || !(await this._claimed(parsed, threadId))) {
+      await this._chat.processMessage(this, threadId, parsed ?? (() => this._parse(raw)));
+    }
+    await this._remember(raw);
+  }
+
+  private async _claimed(message: Message<WAMessage>, threadId: string): Promise<boolean> {
+    for (const addon of this._addons("onMessage")) {
+      if (await addon.onMessage!(message, this._context(threadId))) return true;
+    }
+    return false;
+  }
+
+  private _addons<K extends keyof WWebJSAddon>(hook: K): WWebJSAddon[] {
+    return (this._config.addons ?? []).filter((addon) => addon[hook]);
+  }
+
+  private _context(threadId: string): WWebJSAddonContext {
+    return { adapter: this, chat: this._chat, threadId };
+  }
+
+  private _seenKey(): string {
+    return `wwebjs:${this.name}:seen`;
+  }
+
+  /** Writes run in turn, so an older position never lands after a newer one. */
+  private _save(): Promise<unknown> {
+    const state = this._chat?.getState();
+    if (!state) return Promise.resolve();
+    this._saving = this._saving
+      .then(() => state.set(this._seenKey(), this._seen))
+      .catch((error: unknown) =>
+        this._logger.warn("Could not record the last message delivered", { error }),
+      );
+    return this._saving;
+  }
+
+  private async _remember(raw: WAMessage): Promise<void> {
+    if (this._config.catchUpMs === false || !this._seen) return;
+    const id = serialize(raw.id);
+    const { at, ids } = this._seen;
+    if (raw.timestamp < at || (raw.timestamp === at && ids.includes(id))) return;
+    this._seen = { at: raw.timestamp, ids: raw.timestamp === at ? [...ids, id] : [id] };
+    await this._save();
+  }
+
+  /** WhatsApp Web loads what arrived while the session was down without announcing every message. */
+  private async _catchUp(): Promise<void> {
+    const windowMs = this._config.catchUpMs ?? CATCH_UP_MS;
+    const state = this._chat?.getState();
+    if (windowMs === false || !state) return;
+    this._seen ??= await state.get<Seen>(this._seenKey());
+    const seen = this._seen;
+    if (!seen) {
+      this._seen = { at: Math.floor(Date.now() / 1000), ids: [] };
+      await this._save();
+      return;
+    }
+    const oldest = Math.max(seen.at, Math.floor((Date.now() - windowMs) / 1000));
+    const unseen = (message: WAMessage) =>
+      message.timestamp > oldest ||
+      (message.timestamp === seen.at && !seen.ids.includes(serialize(message.id)));
+    const chats = (await this.client.getChats())
+      .filter((chat) => chat.timestamp >= oldest)
+      .slice(0, MAX_CATCH_UP_CHATS);
+    for (const chat of chats) {
+      const missed = (await chat.fetchMessages({ limit: MAX_CATCH_UP_MESSAGES })).filter(unseen);
+      for (const message of missed) await this._onMessage(message);
+    }
   }
 
   private _onEdit(raw: WAMessage, previousBody: string): void {
@@ -1019,11 +1133,33 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     this._onDisconnected(`UNRESPONSIVE (${state ?? "no answer"})`);
   }
 
-  private _render(message: AdapterPostableMessage): string {
+  private _render(
+    message: AdapterPostableMessage,
+    threadId: string,
+  ): { card?: CardElement; text: string } {
     const card = extractCard(message);
-    return card
-      ? cardToFallbackText(card, { boldFormat: "*" })
-      : this._converter.renderPostable(message);
+    if (!card) return { text: this._converter.renderPostable(message) };
+    for (const addon of this._addons("renderCard")) {
+      const text = addon.renderCard!(card, this._context(threadId));
+      if (text !== undefined) return { card, text };
+    }
+    return { card, text: cardToFallbackText(card, { boldFormat: "*" }) };
+  }
+
+  /** The card is already on WhatsApp, so an addon failing here must not fail the send. */
+  private async _cardSent(
+    card: CardElement | undefined,
+    messageId: string,
+    threadId: string,
+  ): Promise<void> {
+    if (!card) return;
+    for (const addon of this._addons("cardSent")) {
+      try {
+        await addon.cardSent!(card, messageId, this._context(threadId));
+      } catch (error) {
+        this._logger.warn("An addon failed after a card was sent", { error, threadId });
+      }
+    }
   }
 
   private async _send(
@@ -1032,18 +1168,24 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     options: MessageSendOptions = {},
   ): Promise<RawMessage<WAMessage>> {
     const { chatId } = this.decodeThreadId(threadId);
-    const { mentions, text } = extractMentions(this._render(message));
+    const { card, text: rendered } = this._render(message, threadId);
+    const { mentions, text } = extractMentions(rendered);
     const media = await toMediaList(message, this._config.maxMediaBytes);
     const send: MessageSendOptions = {
       ...options,
       ...(mentions.length > 0 ? { mentions } : {}),
     };
+    const voice = this._config.voiceNotes !== false;
 
     const captionIndex = text ? media.findIndex(isCaptionable) : -1;
     const payloads: Array<[MessageContent, MessageSendOptions]> = [];
     if (media.length === 0 || (text && captionIndex === -1)) payloads.push([text, send]);
     media.forEach((item, index) => {
-      payloads.push([item, index === captionIndex ? { ...send, caption: text } : send]);
+      const itemOptions = index === captionIndex ? { ...send, caption: text } : send;
+      payloads.push([
+        item,
+        voice && isAudio(item) ? { ...itemOptions, sendAudioAsVoice: true } : itemOptions,
+      ]);
     });
 
     let first: WAMessage | undefined;
@@ -1055,7 +1197,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       );
       first ??= sent;
     }
-    return this._raw(first, threadId);
+    const raw = this._raw(first, threadId);
+    await this._cardSent(card, raw.id, threadId);
+    return raw;
   }
 
   private async _sendContent(
