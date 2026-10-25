@@ -55,7 +55,7 @@
     "@chat-adapter/tests": "^4.40.0",
     "@types/node": "^22.0.0",
     "@types/qrcode-terminal": "^0.12.2",
-    "@vitest/coverage-v8": "^4.0.0",
+    "@vitest/coverage-v8": "^5.0.5",
     "chat": "^4.40.0",
     "oxlint": "^1.61.0",
     "prettier": "^3.8.3",
