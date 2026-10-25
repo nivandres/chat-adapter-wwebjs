@@ -367,8 +367,25 @@ describe("WWebJSAdapter", () => {
       expect(String(client.sendMessage.mock.calls[0]![1])).toContain("Deploy");
     });
 
-    it("renders a card in WhatsApp markup, with its tables monospaced", async () => {
+    it("sends a card as plain text with no media, and has no modals, unless richContent is on", async () => {
       const { adapter, client } = await connected();
+      await adapter.postMessage(
+        THREAD,
+        Card({
+          children: [
+            Image({ url: "https://example.com/a.png" }),
+            Fields([Field({ label: "Order", value: "#42" })]),
+          ],
+          title: "Receipt",
+        }),
+      );
+      expect(client.sendMessage).toHaveBeenCalledWith(ALICE, "Receipt\nOrder: #42", {});
+      expect(downloadAttachment).not.toHaveBeenCalled();
+      expect(adapter.openModal).toBeUndefined();
+    });
+
+    it("renders a card in WhatsApp markup, with its tables monospaced", async () => {
+      const { adapter, client } = await connected({ richContent: true });
       await adapter.postMessage(
         THREAD,
         Card({
@@ -390,7 +407,7 @@ describe("WWebJSAdapter", () => {
         options.onResponse?.({ headers: { "content-type": "image/png" } } as never);
         return Buffer.from("png");
       });
-      const { adapter, client } = await connected();
+      const { adapter, client } = await connected({ richContent: true });
       await adapter.postMessage(
         THREAD,
         Card({ children: [Image({ url: "https://example.com/a.png" })], title: "Look" }),
@@ -2225,7 +2242,7 @@ describe("WWebJSAdapter", () => {
     it("leaves a card without actions to the plain fallback", async () => {
       const { adapter, client } = await connected({ addons: [numberedActions()] });
       await adapter.postMessage(THREAD, Card({ title: "Just text" }));
-      expect(client.sendMessage.mock.calls[0]![1]).toBe("*Just text*");
+      expect(client.sendMessage.mock.calls[0]![1]).toBe("Just text");
     });
 
     it("never fails a send because the options could not be stored", async () => {
@@ -2266,8 +2283,8 @@ describe("WWebJSAdapter", () => {
     });
 
     it("asks a modal's fields in turn and submits the answers", async () => {
-      const { adapter, chat, client } = await connected();
-      await adapter.openModal(
+      const { adapter, chat, client } = await connected({ richContent: true });
+      await adapter.openModal!(
         triggerIdOf(THREAD, ALICE),
         Modal({
           callbackId: "booking",
@@ -2317,12 +2334,12 @@ describe("WWebJSAdapter", () => {
     });
 
     it("asks again for the fields the handler rejects", async () => {
-      const { adapter, chat, client } = await connected();
+      const { adapter, chat, client } = await connected({ richContent: true });
       chat.processModalSubmit.mockResolvedValueOnce({
         action: "errors",
         errors: { email: "That address bounced." },
       });
-      await adapter.openModal(
+      await adapter.openModal!(
         triggerIdOf(THREAD, ALICE),
         Modal({
           callbackId: "signup",
@@ -2346,12 +2363,12 @@ describe("WWebJSAdapter", () => {
     });
 
     it("searches an external select through onOptionsLoad, then takes a pick", async () => {
-      const { adapter, chat, client } = await connected();
+      const { adapter, chat, client } = await connected({ richContent: true });
       chat.processOptionsLoad.mockResolvedValueOnce([
         { label: "Bogotá", value: "bog" },
         { label: "Boston", value: "bos" },
       ]);
-      await adapter.openModal(
+      await adapter.openModal!(
         triggerIdOf(THREAD, ALICE),
         Modal({
           callbackId: "city",
@@ -2375,8 +2392,8 @@ describe("WWebJSAdapter", () => {
     });
 
     it("stops on cancel, telling onModalClose when the modal asks to be told", async () => {
-      const { adapter, chat, client } = await connected();
-      await adapter.openModal(
+      const { adapter, chat, client } = await connected({ richContent: true });
+      await adapter.openModal!(
         triggerIdOf(THREAD, ALICE),
         Modal({
           callbackId: "survey",
@@ -2407,14 +2424,15 @@ describe("WWebJSAdapter", () => {
     it("speaks the language it is given, and refuses a trigger it never issued", async () => {
       const { adapter, client } = await connected({
         modalTexts: { cancel: "cancelar", cancelHint: "Envía *cancelar* para parar." },
+        richContent: true,
       });
-      await adapter.openModal(
+      await adapter.openModal!(
         triggerIdOf(THREAD, ALICE),
         Modal({ callbackId: "x", children: [TextInput({ id: "a", label: "A" })], title: "T" }),
       );
       expect(lastSent(client)).toContain("Envía *cancelar* para parar.");
       await expect(
-        adapter.openModal("forged", Modal({ callbackId: "x", title: "T" })),
+        adapter.openModal!("forged", Modal({ callbackId: "x", title: "T" })),
       ).rejects.toThrow("Not a trigger");
     });
 

@@ -1,5 +1,6 @@
 import {
   BaseFormatConverter,
+  cardChildToFallbackText,
   chartElementToFallbackText,
   getNodeChildren,
   parseMarkdown,
@@ -121,6 +122,13 @@ function childText(child: CardChild): string {
 /** A card in WhatsApp's markup. Its images go out as media, and its buttons are an addon's to render. */
 export function cardToText(card: CardElement): string {
   return [card.title && `*${card.title}*`, card.subtitle, ...card.children.map(childText)]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** A card as plain lines, for a channel that should not imitate one. */
+export function cardToPlainText(card: CardElement): string {
+  return [card.title, card.subtitle, ...card.children.map(cardChildToFallbackText)]
     .filter(Boolean)
     .join("\n");
 }

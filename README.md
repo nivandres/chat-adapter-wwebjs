@@ -105,6 +105,7 @@ This is a live browser session, not a webhook: `handleWebhook` answers `501`. A 
 | `onQR`               | —               | Receives the QR string during login. Render it with `qrcode-terminal` or similar.                                                                                                                                                                         |
 | `phoneNumber`        | —               | Log in with a pairing code instead of a QR. E.164 without the leading `+`.                                                                                                                                                                                |
 | `receiveOwnMessages` | `false`         | Pass what the paired account did — its messages, edits, deletes and reactions — to the Chat SDK, which still skips most of its own.                                                                                                                       |
+| `richContent`        | `false`         | Imitate what WhatsApp lacks: cards in its markup with their images as media, and modals as conversations. Off, a card is plain text and the adapter has no `openModal`. See [Rich content](#rich-content).                                                |
 | `recommendedArgs`    | `true`          | Start Chromium with `RECOMMENDED_CHROMIUM_ARGS`: one renderer process, no GPU, no component updates.                                                                                                                                                      |
 | `reconnect`          | `true`          | Open the session again when WhatsApp drops it, backing off from 5 seconds to 5 minutes. A logout is never retried.                                                                                                                                        |
 | `slashCommands`      | —               | Commands, such as `"/help"`, whose messages reach `onSlashCommand`. See [Slash commands](#slash-commands).                                                                                                                                                |
@@ -133,17 +134,17 @@ None. A WhatsApp Web session is a browser profile, not an API token, so there is
 
 ### Rich content
 
-| Feature         | Supported                                                                     |
-| --------------- | ----------------------------------------------------------------------------- |
-| Card format     | Yes (WhatsApp markup: bold title, `*Label:* value` fields, monospaced tables) |
-| Buttons         | Partial (answered by number with [`numberedActions()`](#card-actions))        |
-| Link buttons    | Partial (`Label: url` lines)                                                  |
-| Select menus    | Partial (answered by number with `numberedActions()`)                         |
-| Tables          | Partial (ASCII in a code block)                                               |
-| Charts          | Partial (text)                                                                |
-| Fields          | Partial (`Label: value` lines)                                                |
-| Images in cards | Yes (sent as media, the card text as caption)                                 |
-| Modals          | Partial (conversational: each field asked in turn, see [Modals](#modals))     |
+| Feature         | Supported                                                              |
+| --------------- | ---------------------------------------------------------------------- |
+| Card format     | Partial (plain text; WhatsApp markup with `richContent`)               |
+| Buttons         | Partial (answered by number with [`numberedActions()`](#card-actions)) |
+| Link buttons    | Partial (`Label: url` lines)                                           |
+| Select menus    | Partial (answered by number with `numberedActions()`)                  |
+| Tables          | Partial (ASCII in a code block)                                        |
+| Charts          | Partial (text)                                                         |
+| Fields          | Partial (`Label: value` lines)                                         |
+| Images in cards | Partial (as media, with `richContent`)                                 |
+| Modals          | Partial (conversational, with `richContent`; see [Modals](#modals))    |
 
 ### Conversations
 
@@ -235,6 +236,10 @@ The options of a thread's latest card answer for a day (`ttlMs`) and live in the
 
 An addon is a plain object with optional `renderCard`, `cardSent` and `onMessage` hooks, so other layers fit the same way.
 
+## Rich content
+
+WhatsApp Web has no cards, buttons or modals, so the adapter can only imitate them, and by default it doesn't: a card goes out as plain lines, and the adapter has no `openModal`, so `event.openModal()` resolves to `undefined` and your bot can tell. Set `richContent: true` to imitate them: cards in WhatsApp's markup, a bold title, `*Label:* value` fields and monospaced tables, with their images sent as media and the card as caption, and [modals](#modals) as conversations. Buttons answered by number are a separate opt-in, [`numberedActions()`](#card-actions).
+
 ## Streaming
 
 WhatsApp cannot stream, so `streaming` picks how a streamed reply — `thread.post(textStream)` — reaches it. `"buffer"`, the default, sends the reply once it is complete, as WhatsApp's own Cloud API adapter does. `"edit"` sends the first words, then edits that one message as the rest arrives, at most once a second, so the person watches it being written; an edit WhatsApp refuses part-way only delays the words, and the last one always lands. WhatsApp allows edits for 15 minutes, which a reply never outlasts.
@@ -255,7 +260,7 @@ bot.onSlashCommand("/help", async (event) => {
 
 ## Modals
 
-WhatsApp has no modals either, so `openModal()` turns one into a conversation with the person who triggered it: the title and any text it shows, then each field in turn.
+With `richContent`, WhatsApp having no modals, `openModal()` turns one into a conversation with the person who triggered it: the title and any text it shows, then each field in turn.
 
 ```typescript
 bot.onAction("book", (event) =>

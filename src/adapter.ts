@@ -42,7 +42,12 @@ import type {
   PollVote,
   Reaction,
 } from "whatsapp-web.js";
-import { cardImages, cardToText, WWebJSFormatConverter } from "./format-converter.js";
+import {
+  cardImages,
+  cardToPlainText,
+  cardToText,
+  WWebJSFormatConverter,
+} from "./format-converter.js";
 import {
   extractMentions,
   isBroadcastId,
@@ -188,6 +193,18 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
   userName: string;
 
+  /**
+   * WhatsApp has no modals, so with `richContent` one becomes a conversation:
+   * each field is asked in turn, a select by number, and the answers reach
+   * `onModalSubmit`. `cancel`, or the modal's `closeLabel`, stops it. Absent
+   * otherwise, so the SDK knows a modal cannot open.
+   */
+  readonly openModal?: (
+    triggerId: string,
+    modal: ModalElement,
+    contextId?: string,
+  ) => Promise<{ viewId: string }>;
+
   private readonly _config: WWebJSAdapterConfig;
   private readonly _converter = new WWebJSFormatConverter();
   private readonly _ackHandlers: WWebJSAckHandler[] = [];
@@ -233,6 +250,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     }
     // A client already started is someone else's to run, one never started the adapter's, unless told otherwise.
     this._owned = config.manageClient ?? !config.client?.pupBrowser?.isConnected();
+    if (config.richContent) this.openModal = (...args) => this._openModal(...args);
     this._listen();
   }
 
@@ -536,12 +554,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     );
   }
 
-  /**
-   * WhatsApp has no modals, so one becomes a conversation: each field is
-   * asked in turn, a select by number, and the answers reach `onModalSubmit`.
-   * `cancel`, or the modal's `closeLabel`, stops it.
-   */
-  async openModal(
+  private async _openModal(
     triggerId: string,
     modal: ModalElement,
     contextId?: string,
@@ -1514,7 +1527,10 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       const text = addon.renderCard!(card, this._context(threadId));
       if (text !== undefined) return { card, text };
     }
-    return { card, text: cardToText(card) };
+    return {
+      card,
+      text: this._config.richContent ? cardToText(card) : cardToPlainText(card),
+    };
   }
 
   /** The card is already on WhatsApp, so an addon failing here must not fail the send. */
@@ -1544,7 +1560,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     const media = [
       ...(await toMediaList(message, this._config.maxMediaBytes)),
       ...(await Promise.all(
-        (card ? cardImages(card) : []).map((url) =>
+        (card && this._config.richContent ? cardImages(card) : []).map((url) =>
           toMedia({ type: "image", url }, this._config.maxMediaBytes),
         ),
       )),

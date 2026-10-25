@@ -131,6 +131,13 @@ export interface WWebJSAdapterConfig {
   receiveOwnMessages?: boolean;
 
   /**
+   * Render what WhatsApp can only imitate: cards in its markup with their
+   * images as media, and modals as conversations. Off, a card is plain text
+   * and the adapter has no `openModal`. Defaults to `false`.
+   */
+  richContent?: boolean;
+
+  /**
    * Start Chromium with {@link RECOMMENDED_CHROMIUM_ARGS}, which keep it lean
    * and steady in a container. Defaults to `true`.
    */
