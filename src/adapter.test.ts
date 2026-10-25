@@ -166,6 +166,22 @@ describe("WWebJSAdapter", () => {
       expect(adapter.lockScope).toBe("channel");
     });
 
+    it("warns when the client comes from another copy of whatsapp-web.js", () => {
+      const logger = {
+        child: vi.fn(),
+        debug: vi.fn(),
+        error: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+      };
+      class Client extends EventEmitter {}
+      createWWebJSAdapter({ client: new Client() as never, logger });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("another copy"));
+
+      createWWebJSAdapter({ client: fakeClient() as never, logger });
+      expect(logger.warn).toHaveBeenCalledOnce();
+    });
+
     it("rejects an adapter name containing a colon", () => {
       expect(() => createWWebJSAdapter({ adapterName: "wa:main" })).toThrow('":" is not allowed');
     });

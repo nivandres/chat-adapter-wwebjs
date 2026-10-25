@@ -11,6 +11,7 @@
 - `listChats()` lists every chat for an inbox, newest first, and `listThreads()` returns a chat's own thread.
 - A card's images go out as media with the card as their caption, and the card itself in WhatsApp's markup: a bold title, `*Label:* value` fields and monospaced tables. Numbered answers carry a trigger, so an action can open a modal.
 - `voiceNotes` also takes `"ogg"`, to send only OGG/Opus audio, which every phone plays, as a voice note. All audio still goes as one by default.
+- A `client` from another installed copy of whatsapp-web.js than the adapter's is warned about at once: whatsapp-web.js tells media, locations and polls apart with `instanceof`, so every one it sent would otherwise fail with an opaque error inside the page.
 - A location arrives as the place, its address and a map link. Its body used to be the map thumbnail, base64-encoded.
 
 ### Changed

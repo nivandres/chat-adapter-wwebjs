@@ -225,6 +225,12 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     this.userName = config.userName ?? "wwebjs-bot";
     this._logger = config.logger ?? new ConsoleLogger("info").child(name);
     this.client = config.client ?? new WAClient(this._clientOptions());
+    // whatsapp-web.js tells media, locations and polls apart with `instanceof`, which fails across two installed copies.
+    if (config.client?.constructor.name === "Client" && !(config.client instanceof WAClient)) {
+      this._logger.warn(
+        "This client comes from another copy of whatsapp-web.js than the adapter's, so the media, locations and polls it sends will fail. Install a single copy: it is a peer dependency.",
+      );
+    }
     // A client already started is someone else's to run, one never started the adapter's, unless told otherwise.
     this._owned = config.manageClient ?? !config.client?.pupBrowser?.isConnected();
     this._listen();
