@@ -25,9 +25,10 @@ export interface WWebJSThreadId {
 /** Configuration for the whatsapp-web.js adapter. */
 export interface WWebJSAdapterConfig {
   /**
-   * Adapter identity used by Chat SDK serialization and thread ID prefixes.
-   * Set a unique value per account when several run on one `Chat` instance.
-   * Must not contain `:`. Defaults to `"wwebjs"`.
+   * Adapter identity used by Chat SDK serialization, thread ID prefixes and
+   * state keys. Set a unique value per account when several run on one `Chat`
+   * instance or share one state store. Must not contain `:`. Defaults to
+   * `"wwebjs"`.
    */
   adapterName?: string;
 
@@ -36,14 +37,22 @@ export interface WWebJSAdapterConfig {
 
   /**
    * Messages that arrived while the session was down are delivered once it is
-   * back, up to this old, in order and each once. Defaults to 1 day; `false`
-   * turns it off.
+   * back, up to this old, oldest first. A restart part-way through delivers
+   * them again rather than skip any, and the Chat SDK drops a repeat it has
+   * already handled. Defaults to 1 day; `false` turns it off.
    */
   catchUpMs?: number | false;
 
   /**
-   * An existing whatsapp-web.js client to drive. When omitted the adapter
-   * constructs one from {@link WWebJSAdapterConfig.clientOptions}.
+   * An existing whatsapp-web.js client, exposed as `adapter.client`. One
+   * already started is bridged as it is: `connect()` adopts its session
+   * without a second `initialize()`, its options and listeners are left alone,
+   * and its lifecycle stays yours — the adapter never reconnects or destroys
+   * it, nor closes it on a signal, and `disconnect()` only detaches the
+   * adapter. One never started is the adapter's to run, as if it had built
+   * it; {@link WWebJSAdapterConfig.manageClient} decides otherwise. When
+   * omitted the adapter constructs one from
+   * {@link WWebJSAdapterConfig.clientOptions}.
    */
   client?: Client;
 
@@ -72,6 +81,17 @@ export interface WWebJSAdapterConfig {
 
   /** Logger instance. Replaced by the Chat SDK logger once initialized. */
   logger?: Logger;
+
+  /**
+   * Force who runs a `client` you passed, whatever its state: `true` has the
+   * adapter reconnect it, destroy it on `disconnect()` and close it on a
+   * signal; `false` only bridges it. Decided by whether it was started when
+   * omitted.
+   */
+  manageClient?: boolean;
+
+  /** The few phrases a conversational modal sends, to put them in your users' language. */
+  modalTexts?: Partial<WWebJSModalTexts>;
 
   /**
    * Acknowledge inbound messages automatically, so the sender sees blue ticks
@@ -131,14 +151,41 @@ export interface WWebJSAdapterConfig {
    */
   watchdogIntervalMs?: number | false;
 
+  /**
+   * Commands, such as `"/help"`, whose messages reach `onSlashCommand` rather
+   * than the message handlers. `"/help me"` arrives as command `/help` with
+   * text `"me"`. Any other text starting with `/` stays a message.
+   */
+  slashCommands?: string[];
+
+  /**
+   * How a streamed reply reaches WhatsApp. `"buffer"` sends it once, whole;
+   * `"edit"` sends the first words and edits the message as the rest
+   * arrives, at most once a second. Defaults to `"buffer"`.
+   */
+  streaming?: "buffer" | "edit";
+
   /** Bot display name. Defaults to `"wwebjs-bot"`. */
   userName?: string;
 
   /**
    * Send audio as a voice note, played inline with a waveform, rather than as
-   * a file. Defaults to `true`.
+   * a file: `true` for all audio, `"ogg"` for OGG/Opus only, which every
+   * phone plays as one, `false` for none. Defaults to `true`.
    */
-  voiceNotes?: boolean;
+  voiceNotes?: boolean | "ogg";
+}
+
+/** The phrases a conversational modal sends; `cancel` and `skip` are the words people answer with. */
+export interface WWebJSModalTexts {
+  cancel: string;
+  cancelHint: string;
+  cancelled: string;
+  invalid: string;
+  noResults: string;
+  search: string;
+  skip: string;
+  skipHint: string;
 }
 
 /** What an addon is handed alongside each card or message. */

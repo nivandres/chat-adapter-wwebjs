@@ -1,4 +1,9 @@
-import { extractFiles, extractPostableAttachments, ValidationError } from "@chat-adapter/shared";
+import {
+  downloadAttachment,
+  extractFiles,
+  extractPostableAttachments,
+  ValidationError,
+} from "@chat-adapter/shared";
 import type { AdapterPostableMessage, Attachment, FileUpload } from "chat";
 import type { Readable } from "node:stream";
 import type { Message as WAMessage, MessageMedia as WAMessageMedia } from "whatsapp-web.js";
@@ -34,11 +39,10 @@ const MIME_TYPES: Record<string, string> = {
 
 const DEFAULT_MIME_TYPE = "application/octet-stream";
 const DEFAULT_MAX_MEDIA_BYTES = 64 * 1024 * 1024;
-const URL_TIMEOUT_MS = 30_000;
 
 /** whatsapp-web.js main streams media in chunks; 1.34.7 only hands it over whole. */
 type StreamableMessage = WAMessage & {
-  downloadMediaStream?: () => Promise<{ stream: Readable } | undefined>;
+  downloadMediaStream?: () => Promise<{ blobSize?: number; stream: Readable } | undefined>;
 };
 
 interface RawMediaData {
@@ -80,6 +84,9 @@ export async function download(
   if (downloadMediaStream) {
     const streamed = await downloadMediaStream.call(message);
     if (!streamed) throw unavailable(message.id._serialized);
+    if (streamed.blobSize && streamed.blobSize > maxBytes) {
+      throw tooLarge(message.id._serialized, streamed.blobSize, maxBytes);
+    }
     return collect(streamed.stream, maxBytes, message.id._serialized);
   }
   const media = await message.downloadMedia();
@@ -103,8 +110,8 @@ export function toMediaList(
 
 /**
  * Convert a single attachment or file upload into WhatsApp media. An attachment
- * given only by `url` is fetched from the host's own network, so never pass one
- * an end user chose.
+ * given only by `url` is fetched over HTTPS, and never from a private or
+ * internal address.
  */
 export async function toMedia(
   source: Attachment | FileUpload,
@@ -141,6 +148,11 @@ export function isAudio(media: WAMessageMedia): boolean {
   return media.mimetype.startsWith("audio/");
 }
 
+/** WhatsApp plays a voice note reliably, on every phone, only as OGG/Opus. */
+export function isVoiceNote(media: WAMessageMedia): boolean {
+  return media.mimetype.startsWith("audio/ogg");
+}
+
 function mimeTypeOf(filename?: string): string {
   const extension = filename?.split(".").pop()?.toLowerCase();
   return (
@@ -154,16 +166,16 @@ async function fetchMedia(
   source: Attachment,
   maxBytes: number,
 ): Promise<WAMessageMedia> {
-  const response = await fetch(url, { signal: AbortSignal.timeout(URL_TIMEOUT_MS) });
-  if (!response.ok || !response.body) {
-    throw new ValidationError("wwebjs", `Could not fetch ${url}: HTTP ${response.status}.`);
-  }
-  const data = await collect(response.body, maxBytes, url);
+  let contentType: string | undefined;
+  const data = await downloadAttachment(url, {
+    adapter: "wwebjs",
+    limit: maxBytes,
+    onResponse: (response) => {
+      contentType = response.headers["content-type"]?.split(";")[0];
+    },
+  });
   const name = source.name ?? new URL(url).pathname.split("/").pop() ?? null;
-  const mimeType =
-    source.mimeType ??
-    response.headers.get("content-type")?.split(";")[0] ??
-    mimeTypeOf(name ?? undefined);
+  const mimeType = source.mimeType ?? contentType ?? mimeTypeOf(name ?? undefined);
   return new MessageMedia(mimeType, data.toString("base64"), name);
 }
 

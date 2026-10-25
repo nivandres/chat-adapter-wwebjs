@@ -1,12 +1,23 @@
+import { downloadAttachment } from "@chat-adapter/shared";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import {
   Actions,
   Button,
   Card,
+  CardText,
   ConsoleLogger,
+  ExternalSelect,
+  Field,
+  Fields,
+  Image,
   LinkButton,
+  Modal,
+  NumberInput,
+  RadioSelect,
   Select,
   SelectOption,
+  Table,
+  TextInput,
   type ChatInstance,
   type Message,
   type StateAdapter,
@@ -16,8 +27,14 @@ import type { MessageSendOptions } from "whatsapp-web.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createWWebJSAdapter, RECOMMENDED_CHROMIUM_ARGS, WWebJSAdapter } from "./adapter";
 import { isWWebJSAdapter, requireWWebJSAdapter } from "./guards";
+import { triggerIdOf } from "./modals";
 import { numberedActions } from "./numbered-actions";
 import { closeOnSignal } from "./shutdown";
+
+vi.mock("@chat-adapter/shared", async (original) => {
+  const shared = await original<typeof import("@chat-adapter/shared")>();
+  return { ...shared, downloadAttachment: vi.fn(shared.downloadAttachment) };
+});
 
 const unsignal = vi.fn();
 vi.mock("./shutdown", () => ({ closeOnSignal: vi.fn(() => unsignal) }));
@@ -109,6 +126,12 @@ function fakeChatInstance(state: StateAdapter = createMemoryState()) {
     getLogger: () => new ConsoleLogger("error"),
     getState: () => state,
     processAction: vi.fn(),
+    processModalClose: vi.fn(),
+    processModalSubmit: vi.fn(
+      async (_event: unknown, _contextId?: string): Promise<unknown> => undefined,
+    ),
+    processOptionsLoad: vi.fn(async (_event: unknown): Promise<unknown> => undefined),
+    processSlashCommand: vi.fn(),
     processMemberJoinedChannel: vi.fn(),
     processMessage: vi.fn(),
     processMessageDeleted: vi.fn(),
@@ -283,6 +306,18 @@ describe("WWebJSAdapter", () => {
       expect(parsed.text).toBe("@Bot hola");
     });
 
+    it("reads a location as the place and a map link, not its thumbnail", () => {
+      const { adapter } = setup();
+      const parsed = adapter.parseMessage(
+        waMessage({
+          body: "/9j/4AAQSkZJRgABAQ",
+          location: { address: "Calle 93", latitude: "4.67", longitude: "-74.05", name: "Office" },
+          type: "location",
+        }),
+      );
+      expect(parsed.text).toBe("Office\nCalle 93\nhttps://maps.google.com/?q=4.67,-74.05");
+    });
+
     it("carries links found in the body", () => {
       const { adapter } = setup();
       const parsed = adapter.parseMessage(
@@ -316,6 +351,40 @@ describe("WWebJSAdapter", () => {
       expect(String(client.sendMessage.mock.calls[0]![1])).toContain("Deploy");
     });
 
+    it("renders a card in WhatsApp markup, with its tables monospaced", async () => {
+      const { adapter, client } = await connected();
+      await adapter.postMessage(
+        THREAD,
+        Card({
+          children: [
+            CardText("Shipped", { style: "bold" }),
+            Fields([Field({ label: "Order", value: "#42" })]),
+            Table({ headers: ["Item", "Qty"], rows: [["Tea", "2"]] }),
+          ],
+          title: "Receipt",
+        }),
+      );
+      const text = String(client.sendMessage.mock.calls[0]![1]);
+      expect(text).toContain("*Receipt*\n*Shipped*\n*Order:* #42\n```");
+      expect(text).toMatch(/```\n.*Item.*Qty[\s\S]*Tea[\s\S]*```$/);
+    });
+
+    it("sends a card's images as media, its text as their caption", async () => {
+      vi.mocked(downloadAttachment).mockImplementationOnce(async (_url, options) => {
+        options.onResponse?.({ headers: { "content-type": "image/png" } } as never);
+        return Buffer.from("png");
+      });
+      const { adapter, client } = await connected();
+      await adapter.postMessage(
+        THREAD,
+        Card({ children: [Image({ url: "https://example.com/a.png" })], title: "Look" }),
+      );
+      expect(client.sendMessage).toHaveBeenCalledOnce();
+      const [, media, options] = client.sendMessage.mock.calls[0]!;
+      expect(media).toMatchObject({ mimetype: "image/png" });
+      expect(options).toMatchObject({ caption: "*Look*" });
+    });
+
     it("attaches text as the caption of the first captionable media", async () => {
       const { adapter, client } = await connected();
       await adapter.postMessage(THREAD, {
@@ -346,6 +415,22 @@ describe("WWebJSAdapter", () => {
         raw: "",
       });
       expect(client.sendMessage.mock.calls[0]![2]).toMatchObject({ sendAudioAsVoice: true });
+    });
+
+    it("sends any audio as a voice note by default, and only OGG when told to", async () => {
+      const mp3 = { files: [{ data: Buffer.from("x"), filename: "song.mp3" }], raw: "" };
+      const all = await connected();
+      await all.adapter.postMessage(THREAD, mp3);
+      expect(all.client.sendMessage.mock.calls[0]![2]).toMatchObject({ sendAudioAsVoice: true });
+
+      const ogg = await connected({ voiceNotes: "ogg" });
+      await ogg.adapter.postMessage(THREAD, mp3);
+      await ogg.adapter.postMessage(THREAD, {
+        files: [{ data: Buffer.from("x"), filename: "note.ogg" }],
+        raw: "",
+      });
+      expect(ogg.client.sendMessage.mock.calls[0]![2]!.sendAudioAsVoice).toBeUndefined();
+      expect(ogg.client.sendMessage.mock.calls[1]![2]).toMatchObject({ sendAudioAsVoice: true });
     });
 
     it("sends audio as a file when voice notes are off, and other media never as voice", async () => {
@@ -447,6 +532,78 @@ describe("WWebJSAdapter", () => {
       expect(react).toHaveBeenCalledWith("👍");
       await adapter.removeReaction(THREAD, "ID", "👍");
       expect(react).toHaveBeenLastCalledWith("");
+    });
+
+    it("streams a reply as one whole message, and nothing when it is empty", async () => {
+      const { adapter, client } = await connected();
+      const sent = await adapter.stream(
+        THREAD,
+        (async function* () {
+          yield "**Hel";
+          yield { text: "lo**", type: "markdown_text" } as never;
+        })(),
+      );
+      expect(client.sendMessage).toHaveBeenCalledOnce();
+      expect(client.sendMessage).toHaveBeenCalledWith(ALICE, "*Hello*", {});
+      expect(sent).toMatchObject({ id: `true_${ALICE}_SENT` });
+
+      expect(await adapter.stream(THREAD, (async function* () {})())).toBeNull();
+      expect(client.sendMessage).toHaveBeenCalledOnce();
+    });
+
+    it("streams by editing one message as the reply grows, when told to", async () => {
+      vi.useFakeTimers();
+      try {
+        const edit = vi.fn(async (_text: string) => waMessage({ fromMe: true, messageId: "SENT" }));
+        const { adapter, client } = await connected(
+          { streaming: "edit" },
+          {
+            getMessageById: vi.fn(async () =>
+              waMessage({ edit, fromMe: true, messageId: "SENT", timestamp: Date.now() / 1000 }),
+            ),
+          },
+        );
+        async function* reply() {
+          yield "Hello";
+          await vi.advanceTimersByTimeAsync(1_500);
+          yield " there";
+          yield ", friend";
+        }
+        const sent = await adapter.stream(THREAD, reply());
+
+        expect(client.sendMessage).toHaveBeenCalledOnce();
+        expect(client.sendMessage).toHaveBeenCalledWith(ALICE, "Hello", {});
+        expect(edit.mock.calls.map(([text]) => text)).toEqual([
+          "Hello there",
+          "Hello there, friend",
+        ]);
+        expect(sent).toMatchObject({ id: `true_${ALICE}_SENT` });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("refuses to touch a group's message through another thread", async () => {
+      const { adapter } = await connected(
+        {},
+        { getMessageById: vi.fn(async () => waMessage({ remote: GROUP })) },
+      );
+      await expect(adapter.deleteMessage(THREAD, "AAA")).rejects.toThrow("not found");
+      expect(await adapter.fetchMessage(THREAD, "AAA")).toBeNull();
+    });
+
+    it("finds a DM's message whether the thread uses the phone or the LID", async () => {
+      const remove = vi.fn(async () => undefined);
+      const { adapter } = await connected(
+        {},
+        {
+          getMessageById: vi.fn(async () =>
+            waMessage({ delete: remove, remote: "99990000111122@lid" }),
+          ),
+        },
+      );
+      await adapter.deleteMessage(THREAD, "AAA");
+      expect(remove).toHaveBeenCalledWith(true);
     });
 
     it("reports a missing message instead of failing opaquely", async () => {
@@ -603,9 +760,32 @@ describe("WWebJSAdapter", () => {
       await expect(adapter.markAsRead(THREAD)).rejects.toThrow("chat");
     });
 
-    it("has no sub-threads", async () => {
-      const { adapter } = await connected();
-      expect(await adapter.listThreads()).toEqual({ threads: [] });
+    it("lists a chat's own thread, since a WhatsApp chat is one conversation", async () => {
+      const lastMessage = waMessage({ body: "latest" });
+      const { adapter } = await connected(
+        {},
+        { getChatById: vi.fn(async () => waChat({ lastMessage })) },
+      );
+      const { threads } = await adapter.listThreads(THREAD);
+      expect(threads).toHaveLength(1);
+      expect(threads[0]).toMatchObject({ id: THREAD, rootMessage: { text: "latest" } });
+    });
+
+    it("lists every chat for an inbox, newest first, page by page", async () => {
+      const chats = ["A", "B", "C"].map((name, index) =>
+        waChat({
+          id: { _serialized: `1555000000${index}@c.us` },
+          lastMessage: waMessage({ body: name, remote: `1555000000${index}@c.us` }),
+        }),
+      );
+      const status = waChat({ id: { _serialized: "status@broadcast" }, lastMessage: waMessage() });
+      const { adapter } = await connected({}, { getChats: vi.fn(async () => [status, ...chats]) });
+
+      const first = await adapter.listChats({ limit: 2 });
+      expect(first.threads.map(({ rootMessage }) => rootMessage.text)).toEqual(["A", "B"]);
+      const second = await adapter.listChats({ cursor: first.nextCursor, limit: 2 });
+      expect(second.threads.map(({ id }) => id)).toEqual(["wwebjs:15550000002@c.us"]);
+      expect(second.nextCursor).toBeUndefined();
     });
 
     it("looks up a contact", async () => {
@@ -1316,6 +1496,121 @@ describe("WWebJSAdapter", () => {
       expect(client.destroy).toHaveBeenCalled();
     });
 
+    it("never ends the process over an authentication failure after a start that failed", async () => {
+      const unhandled = vi.fn();
+      process.on("unhandledRejection", unhandled);
+      const { adapter, client } = await connected({ reconnect: false });
+      client.initialize.mockRejectedValueOnce(new Error("browser already running"));
+      await expect(adapter.connect()).rejects.toThrow("browser already running");
+
+      client.emit("auth_failure", "session expired");
+      await flush();
+
+      process.off("unhandledRejection", unhandled);
+      expect(unhandled).not.toHaveBeenCalled();
+      expect(client.listenerCount("auth_failure")).toBe(0);
+    });
+
+    it("logs a QR handler that fails rather than ending the process", async () => {
+      const unhandled = vi.fn();
+      process.on("unhandledRejection", unhandled);
+      const { client } = await connected({
+        onQR: vi.fn().mockRejectedValue(new Error("slack down")),
+      });
+
+      client.emit("qr", "scan me");
+      await flush();
+
+      process.off("unhandledRejection", unhandled);
+      expect(unhandled).not.toHaveBeenCalled();
+    });
+
+    describe("with a client of your own", () => {
+      const running = (state = "CONNECTED") => ({
+        getState: vi.fn(async () => state),
+        pupBrowser: Object.assign(new EventEmitter(), { isConnected: () => true }),
+      });
+
+      it("bridges a session already running, without starting it again", async () => {
+        const { adapter, client } = await connected({}, running());
+
+        await adapter.connect();
+
+        expect(client.initialize).not.toHaveBeenCalled();
+        expect(adapter.connection).toBe("connected");
+        expect(adapter.userName).toBe("Bot");
+        expect(adapter.client).toBe(client);
+      });
+
+      it("waits for a session still starting rather than starting it twice", async () => {
+        const { adapter, client } = await connected({}, running("OPENING"));
+
+        const attempt = adapter.connect();
+        await flush();
+        client.emit("ready");
+        await attempt;
+
+        expect(client.initialize).not.toHaveBeenCalled();
+        expect(adapter.connection).toBe("connected");
+      });
+
+      it("runs a client that was never started, as if it had built it", async () => {
+        const { adapter, client } = await connected();
+        const attempt = adapter.connect();
+        await vi.waitFor(() => expect(client.initialize).toHaveBeenCalledOnce());
+        client.emit("ready");
+        await attempt;
+        expect(adapter.connection).toBe("connected");
+      });
+
+      it("runs a started client when forced to, and only bridges an unstarted one when told", async () => {
+        const forced = await connected({ manageClient: true }, running());
+        const attempt = forced.adapter.connect();
+        await vi.waitFor(() => expect(forced.client.initialize).toHaveBeenCalledOnce());
+        forced.client.emit("ready");
+        await attempt;
+        await forced.adapter.disconnect();
+        expect(forced.client.destroy).toHaveBeenCalled();
+
+        const bridged = await connected({ manageClient: false });
+        await bridged.adapter.disconnect();
+        expect(bridged.client.destroy).not.toHaveBeenCalled();
+      });
+
+      it("leaves its lifecycle to you: no reconnect, no destroy, no signals", async () => {
+        const before = process.listenerCount("SIGTERM");
+        const own = vi.fn();
+        const { adapter, chat, client } = await connected({}, running());
+        client.on("message_create", own);
+        await adapter.connect();
+        expect(process.listenerCount("SIGTERM")).toBe(before);
+
+        client.emit("disconnected", "CONFLICT");
+        expect(adapter.connection).toBe("disconnected");
+
+        await adapter.disconnect();
+        client.emit("message_create", waMessage({ body: "after" }));
+        await flush();
+
+        expect(client.destroy).not.toHaveBeenCalled();
+        expect(client.initialize).not.toHaveBeenCalled();
+        expect(chat.processMessage).not.toHaveBeenCalled();
+        expect(own).toHaveBeenCalledOnce();
+      });
+
+      it("listens again when connected after a disconnect", async () => {
+        const { adapter, chat, client } = await connected({}, running());
+        await adapter.connect();
+        await adapter.disconnect();
+
+        await adapter.connect();
+        client.emit("message_create", waMessage({ body: "back" }));
+
+        await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledOnce());
+        expect(client.listenerCount("message_create")).toBe(1);
+      });
+    });
+
     describe("when WhatsApp drops the session", () => {
       beforeEach(() => {
         vi.useFakeTimers();
@@ -1337,7 +1632,7 @@ describe("WWebJSAdapter", () => {
       });
 
       it("opens it again once the browser crashes, which WhatsApp never reports", async () => {
-        const browser = new EventEmitter();
+        const browser = Object.assign(new EventEmitter(), { isConnected: () => false });
         const { adapter, client } = await connected({}, { pupBrowser: browser });
         const first = adapter.connect();
         client.emit("ready");
@@ -1352,7 +1647,7 @@ describe("WWebJSAdapter", () => {
       });
 
       it("does not reopen a browser closed on purpose", async () => {
-        const browser = new EventEmitter();
+        const browser = Object.assign(new EventEmitter(), { isConnected: () => false });
         const { adapter, client } = await connected({}, { pupBrowser: browser });
         const first = adapter.connect();
         client.emit("ready");
@@ -1363,6 +1658,100 @@ describe("WWebJSAdapter", () => {
         await vi.advanceTimersByTimeAsync(600_000);
 
         expect(client.initialize).toHaveBeenCalledTimes(1);
+      });
+
+      describe("a browser that dropped but is still running", () => {
+        function browserWith(overrides: Record<string, unknown>) {
+          const child = Object.assign(new EventEmitter(), {
+            exitCode: null as number | null,
+            kill: vi.fn(),
+            pid: 4242,
+            signalCode: null,
+            ...overrides,
+          });
+          const browser = Object.assign(new EventEmitter(), {
+            isConnected: () => false,
+            process: () => child,
+          });
+          const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+            child.exitCode = 137;
+            child.emit("exit");
+            return true;
+          });
+          return { browser, kill };
+        }
+
+        it("is not mistaken for a crash when the adapter closes it itself", async () => {
+          const { browser, kill } = browserWith({});
+          const { adapter, client } = await connected(
+            { watchdogIntervalMs: 30_000 },
+            {
+              destroy: vi.fn(async () => {
+                await flush();
+                browser.emit("disconnected");
+              }),
+              pupBrowser: browser,
+            },
+          );
+          const first = adapter.connect();
+          client.emit("ready");
+          await first;
+          client.getState.mockResolvedValue("UNPAIRED");
+
+          await vi.advanceTimersByTimeAsync(60_000 + 5_000);
+          client.getState.mockResolvedValue("CONNECTED");
+          client.emit("ready");
+          await vi.advanceTimersByTimeAsync(600_000);
+
+          expect(client.initialize).toHaveBeenCalledTimes(2);
+          expect(adapter.connection).toBe("connected");
+          kill.mockRestore();
+        });
+
+        it("is ended before the session is opened again, since it keeps the profile locked", async () => {
+          const { browser, kill } = browserWith({});
+          const { adapter, client } = await connected({}, { pupBrowser: browser });
+          const first = adapter.connect();
+          client.emit("ready");
+          await first;
+
+          browser.emit("disconnected");
+          await vi.advanceTimersByTimeAsync(5_000);
+
+          expect(kill).toHaveBeenCalledWith(-4242, "SIGKILL");
+          expect(client.initialize).toHaveBeenCalledTimes(2);
+          expect(kill.mock.invocationCallOrder[0]).toBeLessThan(
+            client.initialize.mock.invocationCallOrder[1]!,
+          );
+          kill.mockRestore();
+        });
+
+        it("is left alone once it has exited", async () => {
+          const { browser, kill } = browserWith({ exitCode: 0 });
+          const { adapter, client } = await connected({}, { pupBrowser: browser });
+          const first = adapter.connect();
+          client.emit("ready");
+          await first;
+
+          browser.emit("disconnected");
+          await vi.advanceTimersByTimeAsync(5_000);
+
+          expect(kill).not.toHaveBeenCalled();
+          kill.mockRestore();
+        });
+
+        it("is ended when the adapter disconnects", async () => {
+          const { browser, kill } = browserWith({});
+          const { adapter, client } = await connected({}, { pupBrowser: browser });
+          const first = adapter.connect();
+          client.emit("ready");
+          await first;
+
+          await adapter.disconnect();
+
+          expect(kill).toHaveBeenCalledWith(-4242, "SIGKILL");
+          kill.mockRestore();
+        });
       });
 
       it("does not let a pending retry tear down a session opened in the meantime", async () => {
@@ -1551,6 +1940,81 @@ describe("WWebJSAdapter", () => {
       await vi.waitFor(async () => expect(await delivered()).toEqual(["same second", "later"]));
     });
 
+    it("gathers what every chat missed, oldest first, past a chat or a handler that fails", async () => {
+      const state = createMemoryState();
+      await state.connect();
+      await state.set(seenKey, { at: T, ids: [] });
+      const chat = fakeChatInstance(state);
+      chat.processMessage.mockRejectedValueOnce(new Error("handler down"));
+      const now = Math.floor(Date.now() / 1000);
+      const inbox = (remote: string, ...messages: unknown[]) =>
+        waChat({
+          fetchMessages: vi.fn(async () => messages),
+          id: { _serialized: remote },
+          timestamp: now,
+        });
+      const client = fakeClient({
+        getChats: vi.fn(async () => [
+          inbox(ALICE, waMessage({ body: "third", messageId: "C", timestamp: T + 9 })),
+          waChat({
+            fetchMessages: vi.fn().mockRejectedValue(new Error("newsletter")),
+            timestamp: now,
+          }),
+          inbox(
+            GROUP,
+            waMessage({ body: "first", messageId: "A", remote: GROUP, timestamp: T + 1 }),
+            waMessage({ body: "second", messageId: "B", remote: GROUP, timestamp: T + 2 }),
+          ),
+        ]),
+      });
+      const adapter = createWWebJSAdapter({
+        catchUpMs: Number.MAX_SAFE_INTEGER,
+        client: client as never,
+      });
+      await adapter.initialize(chat as unknown as ChatInstance);
+      client.emit("ready");
+
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledTimes(3));
+      const order = chat.processMessage.mock.calls.map(([, , message]) => message);
+      expect(
+        await Promise.all(
+          order.map(async (message) => (await (message as () => Promise<Message>)()).text),
+        ),
+      ).toEqual(["first", "second", "third"]);
+      await vi.waitFor(async () => expect(await state.get(seenKey)).toMatchObject({ at: T + 9 }));
+    });
+
+    it("handles a message once when it arrives live and is caught up too", async () => {
+      const late = waMessage({ body: "both", messageId: "L", timestamp: T + 3 });
+      const { chat, client } = await readyWith({ at: T, ids: [] }, [late], {
+        catchUpMs: Number.MAX_SAFE_INTEGER,
+      });
+      client.emit("message_create", late);
+      await flush();
+      expect(chat.processMessage).toHaveBeenCalledOnce();
+    });
+
+    it("discards a position recorded for another number, as after pairing a new one", async () => {
+      const { client, state } = await readyWith(
+        { at: T, ids: [], wid: "15559999999@c.us" } as never,
+        [waMessage({ body: "not mine", messageId: "X", timestamp: T + 1 })],
+      );
+      expect(client.getChats).not.toHaveBeenCalled();
+      expect(await state.get(seenKey)).toMatchObject({ ids: [], wid: BOT });
+    });
+
+    it("says so when it could catch up on only part of what was missed", async () => {
+      const warn = vi.spyOn(ConsoleLogger.prototype, "warn");
+      const many = Array.from({ length: 50 }, (_, index) =>
+        waMessage({ messageId: `M${index}`, timestamp: T + 1 + index }),
+      );
+      await readyWith({ at: T, ids: [] }, many, { catchUpMs: Number.MAX_SAFE_INTEGER });
+      await vi.waitFor(() =>
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("older ones were missed")),
+      );
+      warn.mockRestore();
+    });
+
     it("starts counting on the first run, replaying nothing from before", async () => {
       const { chat, client, state } = await readyWith(undefined, []);
       expect(client.getChats).not.toHaveBeenCalled();
@@ -1564,7 +2028,11 @@ describe("WWebJSAdapter", () => {
       });
       client.emit("message_create", waMessage({ body: "new", messageId: "N", timestamp: T + 99 }));
       await vi.waitFor(async () =>
-        expect(await state.get(seenKey)).toEqual({ at: T + 99, ids: [`false_${ALICE}_N`] }),
+        expect(await state.get(seenKey)).toEqual({
+          at: T + 99,
+          ids: [`false_${ALICE}_N`],
+          wid: BOT,
+        }),
       );
     });
 
@@ -1671,10 +2139,12 @@ describe("WWebJSAdapter", () => {
 
     it("turns a reply with a number or a label into the card's action, not a message", async () => {
       const { adapter, chat, client } = await withAddon();
-
       client.emit("message_create", waMessage({ body: " 3 ", messageId: "R1" }));
-      client.emit("message_create", waMessage({ body: "approve", messageId: "R2" }));
-      await vi.waitFor(() => expect(chat.processAction).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(chat.processAction).toHaveBeenCalledOnce());
+
+      const byLabel = await withAddon();
+      byLabel.client.emit("message_create", waMessage({ body: "approve", messageId: "R2" }));
+      await vi.waitFor(() => expect(byLabel.chat.processAction).toHaveBeenCalledOnce());
 
       expect(chat.processAction).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -1686,11 +2156,42 @@ describe("WWebJSAdapter", () => {
         }),
         undefined,
       );
-      expect(chat.processAction).toHaveBeenCalledWith(
+      expect(byLabel.chat.processAction).toHaveBeenCalledWith(
         expect.objectContaining({ actionId: "approve", value: "yes" }),
         undefined,
       );
       expect(chat.processMessage).not.toHaveBeenCalled();
+    });
+
+    it("takes one pick per card, so a repeated answer runs nothing twice", async () => {
+      const { chat, client } = await withAddon();
+      client.emit("message_create", waMessage({ body: "1", messageId: "R1" }));
+      await vi.waitFor(() => expect(chat.processAction).toHaveBeenCalledOnce());
+
+      client.emit("message_create", waMessage({ body: "1", messageId: "R2" }));
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledOnce());
+      expect(chat.processAction).toHaveBeenCalledOnce();
+    });
+
+    it("ignores the bot's own messages and a reply quoting another message", async () => {
+      const { chat, client } = await withAddon({ keepMessage: false });
+      client.emit(
+        "message_create",
+        waMessage({
+          body: "1",
+          getQuotedMessage: async () => waMessage({ messageId: "OTHER" }),
+          hasQuotedMsg: true,
+          messageId: "R1",
+        }),
+      );
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledOnce());
+      expect(chat.processAction).not.toHaveBeenCalled();
+
+      const own = await connected({ addons: [numberedActions()], receiveOwnMessages: true });
+      await own.adapter.postMessage(THREAD, card);
+      own.client.emit("message_create", waMessage({ body: "1", fromMe: true, messageId: "R2" }));
+      await vi.waitFor(() => expect(own.chat.processMessage).toHaveBeenCalledOnce());
+      expect(own.chat.processAction).not.toHaveBeenCalled();
     });
 
     it("delivers anything else as a message, and the pick too when asked", async () => {
@@ -1721,6 +2222,199 @@ describe("WWebJSAdapter", () => {
       await expect(adapter.postMessage(THREAD, card)).resolves.toMatchObject({
         id: `true_${ALICE}_SENT`,
       });
+    });
+  });
+
+  describe("slash commands and modals", () => {
+    const say = (client: ReturnType<typeof fakeClient>, body: string, messageId: string) =>
+      client.emit("message_create", waMessage({ body, messageId }));
+    const lastSent = (client: ReturnType<typeof fakeClient>) =>
+      String(client.sendMessage.mock.calls.at(-1)![1]);
+
+    it("turns a declared command into onSlashCommand, and leaves any other / text a message", async () => {
+      const { adapter, chat, client } = await connected({ slashCommands: ["/help"] });
+      say(client, "/HELP billing  ", "C1");
+      say(client, "/other thing", "C2");
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledOnce());
+
+      expect(chat.processSlashCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adapter,
+          channelId: THREAD,
+          command: "/help",
+          text: "billing",
+          triggerId: triggerIdOf(THREAD, ALICE),
+        }),
+        undefined,
+      );
+    });
+
+    it("asks a modal's fields in turn and submits the answers", async () => {
+      const { adapter, chat, client } = await connected();
+      await adapter.openModal(
+        triggerIdOf(THREAD, ALICE),
+        Modal({
+          callbackId: "booking",
+          children: [
+            TextInput({ id: "name", label: "Name" }),
+            NumberInput({ id: "guests", label: "Guests", max: 8, min: 1 }),
+            Select({
+              id: "day",
+              label: "Day",
+              options: [
+                SelectOption({ label: "Mon", value: "mon" }),
+                SelectOption({ label: "Tue", value: "tue" }),
+              ],
+            }),
+            TextInput({ id: "note", label: "Note", optional: true }),
+          ],
+          title: "Booking",
+        }),
+        "ctx",
+      );
+      expect(lastSent(client)).toContain("*Booking*");
+      expect(lastSent(client)).toContain("*Name*");
+
+      for (const [body, asked] of [
+        ["Iván", "*Guests*"],
+        ["20", "That doesn't fit"],
+        ["3", "1. Mon\n2. Tue"],
+        ["2", "Send *skip*"],
+      ] as const) {
+        const before = client.sendMessage.mock.calls.length;
+        say(client, body, `M${before}`);
+        await vi.waitFor(() => expect(client.sendMessage.mock.calls.length).toBe(before + 1));
+        expect(lastSent(client)).toContain(asked);
+      }
+      say(client, "skip", "LAST");
+
+      await vi.waitFor(() =>
+        expect(chat.processModalSubmit).toHaveBeenCalledWith(
+          expect.objectContaining({
+            callbackId: "booking",
+            values: { day: "tue", guests: "3", name: "Iván" },
+          }),
+          "ctx",
+        ),
+      );
+      expect(chat.processMessage).not.toHaveBeenCalled();
+    });
+
+    it("asks again for the fields the handler rejects", async () => {
+      const { adapter, chat, client } = await connected();
+      chat.processModalSubmit.mockResolvedValueOnce({
+        action: "errors",
+        errors: { email: "That address bounced." },
+      });
+      await adapter.openModal(
+        triggerIdOf(THREAD, ALICE),
+        Modal({
+          callbackId: "signup",
+          children: [
+            TextInput({ id: "name", label: "Name" }),
+            TextInput({ id: "email", label: "Email" }),
+          ],
+          title: "Sign up",
+        }),
+      );
+      say(client, "Ana", "A1");
+      await vi.waitFor(() => expect(lastSent(client)).toContain("*Email*"));
+      say(client, "ana@bad", "A2");
+      await vi.waitFor(() => expect(lastSent(client)).toContain("That address bounced."));
+      say(client, "ana@good.com", "A3");
+
+      await vi.waitFor(() => expect(chat.processModalSubmit).toHaveBeenCalledTimes(2));
+      expect(chat.processModalSubmit.mock.calls[1]![0]).toMatchObject({
+        values: { email: "ana@good.com", name: "Ana" },
+      });
+    });
+
+    it("searches an external select through onOptionsLoad, then takes a pick", async () => {
+      const { adapter, chat, client } = await connected();
+      chat.processOptionsLoad.mockResolvedValueOnce([
+        { label: "Bogotá", value: "bog" },
+        { label: "Boston", value: "bos" },
+      ]);
+      await adapter.openModal(
+        triggerIdOf(THREAD, ALICE),
+        Modal({
+          callbackId: "city",
+          children: [ExternalSelect({ id: "city", label: "City" })],
+          title: "Where",
+        }),
+      );
+      say(client, "bo", "S1");
+      await vi.waitFor(() => expect(lastSent(client)).toContain("1. Bogotá\n2. Boston"));
+      say(client, "2", "S2");
+
+      await vi.waitFor(() =>
+        expect(chat.processModalSubmit).toHaveBeenCalledWith(
+          expect.objectContaining({ values: { city: "bos" } }),
+          undefined,
+        ),
+      );
+      expect(chat.processOptionsLoad).toHaveBeenCalledWith(
+        expect.objectContaining({ actionId: "city", query: "bo" }),
+      );
+    });
+
+    it("stops on cancel, telling onModalClose when the modal asks to be told", async () => {
+      const { adapter, chat, client } = await connected();
+      await adapter.openModal(
+        triggerIdOf(THREAD, ALICE),
+        Modal({
+          callbackId: "survey",
+          children: [
+            RadioSelect({
+              id: "score",
+              label: "Score",
+              options: [SelectOption({ label: "Good", value: "good" })],
+            }),
+          ],
+          notifyOnClose: true,
+          title: "Survey",
+        }),
+      );
+      say(client, "Cancel", "X1");
+
+      await vi.waitFor(() =>
+        expect(chat.processModalClose).toHaveBeenCalledWith(
+          expect.objectContaining({ callbackId: "survey" }),
+          undefined,
+        ),
+      );
+      expect(lastSent(client)).toBe("Cancelled.");
+      say(client, "after", "X2");
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledOnce());
+    });
+
+    it("speaks the language it is given, and refuses a trigger it never issued", async () => {
+      const { adapter, client } = await connected({
+        modalTexts: { cancel: "cancelar", cancelHint: "Envía *cancelar* para parar." },
+      });
+      await adapter.openModal(
+        triggerIdOf(THREAD, ALICE),
+        Modal({ callbackId: "x", children: [TextInput({ id: "a", label: "A" })], title: "T" }),
+      );
+      expect(lastSent(client)).toContain("Envía *cancelar* para parar.");
+      await expect(
+        adapter.openModal("forged", Modal({ callbackId: "x", title: "T" })),
+      ).rejects.toThrow("Not a trigger");
+    });
+
+    it("lets a numbered answer open a modal from its action", async () => {
+      const { adapter, chat, client } = await connected({ addons: [numberedActions()] });
+      await adapter.postMessage(
+        THREAD,
+        Card({ children: [Actions([Button({ id: "book", label: "Book" })])], title: "Menu" }),
+      );
+      say(client, "1", "N1");
+      await vi.waitFor(() =>
+        expect(chat.processAction).toHaveBeenCalledWith(
+          expect.objectContaining({ triggerId: triggerIdOf(THREAD, ALICE) }),
+          undefined,
+        ),
+      );
     });
   });
 

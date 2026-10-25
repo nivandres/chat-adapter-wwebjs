@@ -1,6 +1,6 @@
 {
   "name": "chat-adapter-wwebjs",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "WhatsApp adapter for Chat SDK, backed by whatsapp-web.js",
   "author": "nivandres",
   "license": "MIT",

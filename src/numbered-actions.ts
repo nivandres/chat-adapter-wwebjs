@@ -1,11 +1,12 @@
-import { cardToFallbackText } from "@chat-adapter/shared";
 import type { ActionsElement, CardChild, CardElement } from "chat";
+import { cardToText } from "./format-converter.js";
+import { triggerIdOf } from "./modals.js";
 import type { WWebJSAddon, WWebJSAddonContext } from "./types.js";
 
 export interface NumberedActionsOptions {
   /** Also deliver the reply that picked an option as a message. Defaults to `false`. */
   keepMessage?: boolean;
-  /** How long a card's options answer to their number or label. Defaults to 1 day. */
+  /** How long a card's options answer to their number or label; the first pick ends them. Defaults to 1 day. */
   ttlMs?: number;
 }
 
@@ -68,9 +69,7 @@ export function numberedActions(options: NumberedActionsOptions = {}): WWebJSAdd
     renderCard(card) {
       const { lines } = layout(card);
       if (lines.length === 0) return undefined;
-      return [cardToFallbackText(card, { boldFormat: "*" }), lines.join("\n")]
-        .filter(Boolean)
-        .join("\n\n");
+      return [cardToText(card), lines.join("\n")].filter(Boolean).join("\n\n");
     },
     async cardSent(card, messageId, context) {
       const { choices } = layout(card);
@@ -80,13 +79,21 @@ export function numberedActions(options: NumberedActionsOptions = {}): WWebJSAdd
         .set<Offer>(keyOf(context), { choices, messageId }, options.ttlMs ?? TTL_MS);
     },
     async onMessage(message, context) {
-      const offer = await context.chat?.getState().get<Offer>(keyOf(context));
-      if (!offer || !context.chat) return false;
+      if (message.author.isMe || !context.chat) return false;
+      const state = context.chat.getState();
+      const offer = await state.get<Offer>(keyOf(context));
+      // A reply quoting another message answers that one, not the latest card.
+      if (!offer || (message.replyTo && message.replyTo.id !== offer.messageId)) return false;
       const reply = message.text.trim();
       const choice = /^\d+$/.test(reply)
         ? offer.choices[Number(reply) - 1]
         : offer.choices.find(({ label }) => label.toLowerCase() === reply.toLowerCase());
       if (!choice) return false;
+      // One pick per card, so a repeated answer cannot run an action twice.
+      const ttlMs = options.ttlMs ?? TTL_MS;
+      if (!(await state.setIfNotExists(`${keyOf(context)}:${offer.messageId}`, true, ttlMs))) {
+        return false;
+      }
       await context.chat.processAction(
         {
           actionId: choice.actionId,
@@ -94,6 +101,7 @@ export function numberedActions(options: NumberedActionsOptions = {}): WWebJSAdd
           messageId: offer.messageId,
           raw: message.raw,
           threadId: context.threadId,
+          triggerId: triggerIdOf(context.threadId, message.author.userId),
           user: message.author,
           value: choice.value,
         },

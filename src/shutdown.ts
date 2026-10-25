@@ -1,9 +1,14 @@
 const SIGNALS = ["SIGHUP", "SIGINT", "SIGTERM"] as const;
+/** Inside the 10 seconds Docker and Kubernetes allow before they kill the process outright. */
+const CLOSE_TIMEOUT_MS = 8_000;
 const sessions = new Set<() => Promise<void>>();
 
 async function onSignal(signal: NodeJS.Signals): Promise<void> {
   for (const name of SIGNALS) process.off(name, onSignal);
-  await Promise.allSettled([...sessions].map((close) => close()));
+  await Promise.race([
+    Promise.allSettled([...sessions].map((close) => close())),
+    new Promise((resolve) => setTimeout(resolve, CLOSE_TIMEOUT_MS).unref()),
+  ]);
   // Raised again with nothing left listening, so it ends the process as it would have; an app's own handler keeps that call.
   if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
 }

@@ -1,9 +1,6 @@
-import {
-  cardToFallbackText,
-  extractCard,
-  ResourceNotFoundError,
-  ValidationError,
-} from "@chat-adapter/shared";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { extractCard, ResourceNotFoundError, ValidationError } from "@chat-adapter/shared";
 import {
   ConsoleLogger,
   defaultEmojiResolver,
@@ -20,11 +17,15 @@ import {
   type FetchOptions,
   type FetchResult,
   type FormattedContent,
+  type ListThreadsOptions,
   type ListThreadsResult,
   type LockScope,
   type Logger,
+  type ModalElement,
   type RawMessage,
+  type StreamChunk,
   type ThreadInfo,
+  type ThreadSummary,
   type UserInfo,
   type WebhookOptions,
 } from "chat";
@@ -33,6 +34,7 @@ import type {
   Client,
   GroupChat,
   GroupNotification,
+  Location as WALocation,
   Message as WAMessage,
   MessageAck,
   MessageContent,
@@ -40,7 +42,7 @@ import type {
   PollVote,
   Reaction,
 } from "whatsapp-web.js";
-import { WWebJSFormatConverter } from "./format-converter.js";
+import { cardImages, cardToText, WWebJSFormatConverter } from "./format-converter.js";
 import {
   extractMentions,
   isBroadcastId,
@@ -50,7 +52,27 @@ import {
   toChatId,
   toUser,
 } from "./jid.js";
-import { download, isAudio, isCaptionable, toAttachments, toMedia, toMediaList } from "./media.js";
+import {
+  download,
+  isAudio,
+  isCaptionable,
+  isVoiceNote,
+  toAttachments,
+  toMedia,
+  toMediaList,
+} from "./media.js";
+import {
+  answerOf,
+  createForm,
+  currentField,
+  DEFAULT_MODAL_TEXTS,
+  flattenOptions,
+  fromTrigger,
+  introOf,
+  questionOf,
+  triggerIdOf,
+  type Form,
+} from "./modals.js";
 import { closeOnSignal } from "./shutdown.js";
 import type {
   WWebJSAck,
@@ -64,6 +86,7 @@ import type {
   WWebJSGroupEvent,
   WWebJSGroupEventHandler,
   WWebJSGroupParticipant,
+  WWebJSModalTexts,
   WWebJSPollVote,
   WWebJSPollVoteHandler,
   WWebJSSendEventArgs,
@@ -120,12 +143,21 @@ const CONNECT_TIMEOUT_MS = 120_000;
 const WATCHDOG_INTERVAL_MS = 60_000;
 const RECONNECT_MIN_MS = 5_000;
 const RECONNECT_MAX_MS = 300_000;
+const KILL_WAIT_MS = 2_000;
+/** WhatsApp takes an edit at a time; a second between them keeps a streamed reply readable and unthrottled. */
+const STREAM_EDIT_MS = 1_000;
+/** A modal left unanswered stops waiting for its answers. */
+const FORM_TTL_MS = 86_400_000;
 const MAX_POLL_OPTIONS = 12;
 const MIN_POLL_OPTIONS = 2;
 const CATCH_UP_MS = 86_400_000;
 /** A session down for long must not flood the bot with every chat it has. */
 const MAX_CATCH_UP_CHATS = 100;
 const MAX_CATCH_UP_MESSAGES = 50;
+/** Inbound ids remembered, so a message delivered live and caught up again is handled once. */
+const MAX_RECENT = 1000;
+/** A timestamp is set by the sender's device, so one from the future cannot move the position past what is still to come. */
+const CLOCK_SKEW_S = 60;
 
 /** What a single WhatsApp Web tab can do without, on top of the flags Puppeteer already passes. */
 export const RECOMMENDED_CHROMIUM_ARGS = [
@@ -143,6 +175,8 @@ interface PollVoteSubscription {
 interface Seen {
   at: number;
   ids: string[];
+  /** The account it was recorded for; absent before 0.1.3. */
+  wid?: string;
 }
 
 export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
@@ -170,8 +204,14 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   private _state: WWebJSConnection = "idle";
   private _watchdog?: ReturnType<typeof setInterval>;
   private _strikes = 0;
+  private readonly _owned: boolean;
+  private _attempts = 0;
+  private _unwatch?: () => void;
+  private _listeners: Array<Parameters<Client["off"]>> = [];
   private _unsignal?: () => void;
   private _seen?: Seen | null;
+  private _behind?: WAMessage[];
+  private readonly _recent = new Set<string>();
   private _saving: Promise<unknown> = Promise.resolve();
 
   constructor(config: WWebJSAdapterConfig = {}) {
@@ -185,6 +225,8 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     this.userName = config.userName ?? "wwebjs-bot";
     this._logger = config.logger ?? new ConsoleLogger("info").child(name);
     this.client = config.client ?? new WAClient(this._clientOptions());
+    // A client already started is someone else's to run, one never started the adapter's, unless told otherwise.
+    this._owned = config.manageClient ?? !config.client?.pupBrowser?.isConnected();
     this._listen();
   }
 
@@ -218,19 +260,25 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     this._closed = false;
     clearTimeout(this._retry);
     this._retry = undefined;
+    if (this._listeners.length === 0) this._listen();
     this._watch();
-    if (this._config.handleSignals !== false) {
+    if (this._owned && this._config.handleSignals !== false) {
       this._unsignal ??= closeOnSignal(() => this.disconnect());
     }
-    this._connection ??= this._connect().catch((error: unknown) => {
-      this._connection = null;
-      if (this._state !== "logged_out" && !this._closed) this._state = "disconnected";
+    if (this._connection) return this._connection;
+    // A newer attempt owns the connection; a superseded one must not reset it.
+    const attempt = ++this._attempts;
+    this._connection = this._connect(attempt).catch((error: unknown) => {
+      if (attempt === this._attempts) {
+        this._connection = null;
+        if (this._state !== "logged_out" && !this._closed) this._state = "disconnected";
+      }
       throw error;
     });
     return this._connection;
   }
 
-  /** Close the browser session. */
+  /** Close the browser session, or only detach from a client the adapter does not manage. */
   async disconnect(): Promise<void> {
     this._closed = true;
     this._state = "closed";
@@ -240,7 +288,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     this._connection = null;
     this._unsignal?.();
     this._unsignal = undefined;
-    await this.client.destroy();
+    await this._saving;
+    if (!this._owned) return this._unlisten();
+    await this._close();
   }
 
   encodeThreadId(platformData: WWebJSThreadId): string {
@@ -285,7 +335,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   parseMessage(raw: WAMessage): Message<WAMessage> {
     const bot = this._botUsers();
     const text = this._named(
-      raw.body ?? "",
+      raw.location ? locationText(raw.location) : (raw.body ?? ""),
       this._mentioned(raw).filter((user) => bot.has(user)),
       () => this.userName,
     );
@@ -338,7 +388,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   ): Promise<RawMessage<WAMessage>> {
     const { card, text: rendered } = this._render(message, threadId);
     const { mentions, text } = extractMentions(rendered);
-    const target = await this._requireMessage(messageId);
+    const target = await this._requireMessage(messageId, threadId);
     const edit = () => target.edit(text, mentions.length > 0 ? { mentions } : undefined);
     let edited = await edit();
     const fresh = target.fromMe && Date.now() - target.timestamp * 1000 < FRESH_MS;
@@ -357,24 +407,52 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     return raw;
   }
 
-  async deleteMessage(_threadId: string, messageId: string): Promise<void> {
-    await (await this._requireMessage(messageId)).delete(true);
+  /** WhatsApp cannot stream, and editing twice a second as the SDK otherwise would floods the chat; the reply goes out once, whole. */
+  async stream(
+    threadId: string,
+    textStream: AsyncIterable<string | StreamChunk>,
+  ): Promise<RawMessage<WAMessage> | null> {
+    const edits = this._config.streaming === "edit";
+    let text = "";
+    let sent: RawMessage<WAMessage> | undefined;
+    let shown = "";
+    let at = 0;
+    for await (const chunk of textStream) {
+      if (typeof chunk === "string") text += chunk;
+      else if (chunk.type === "markdown_text") text += chunk.text;
+      if (!edits || !text.trim() || Date.now() - at < STREAM_EDIT_MS) continue;
+      // An edit WhatsApp refuses part-way only delays the words; the last one must land.
+      sent = sent
+        ? await this.editMessage(threadId, sent.id, { markdown: text }).catch(() => sent)
+        : await this.postMessage(threadId, { markdown: text });
+      shown = text;
+      at = Date.now();
+    }
+    if (!text.trim()) return null;
+    if (!sent) return this.postMessage(threadId, { markdown: text });
+    return text === shown ? sent : this.editMessage(threadId, sent.id, { markdown: text });
+  }
+
+  async deleteMessage(threadId: string, messageId: string): Promise<void> {
+    await (await this._requireMessage(messageId, threadId)).delete(true);
   }
 
   async addReaction(
-    _threadId: string,
+    threadId: string,
     messageId: string,
     emoji: EmojiValue | string,
   ): Promise<void> {
-    await (await this._requireMessage(messageId)).react(defaultEmojiResolver.toGChat(emoji));
+    await (
+      await this._requireMessage(messageId, threadId)
+    ).react(defaultEmojiResolver.toGChat(emoji));
   }
 
   async removeReaction(
-    _threadId: string,
+    threadId: string,
     messageId: string,
     _emoji: EmojiValue | string,
   ): Promise<void> {
-    await (await this._requireMessage(messageId)).react("");
+    await (await this._requireMessage(messageId, threadId)).react("");
   }
 
   async fetchMessages(threadId: string, options?: FetchOptions): Promise<FetchResult<WAMessage>> {
@@ -388,8 +466,8 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     return this.fetchMessages(channelId, options);
   }
 
-  async fetchMessage(_threadId: string, messageId: string): Promise<Message<WAMessage> | null> {
-    const message = await this.client.getMessageById(messageId).catch(() => null);
+  async fetchMessage(threadId: string, messageId: string): Promise<Message<WAMessage> | null> {
+    const message = await this._findMessage(messageId, threadId);
     return message ? this.parseMessage(message) : null;
   }
 
@@ -419,9 +497,53 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     };
   }
 
-  /** WhatsApp conversations are flat, so a channel never contains sub-threads. */
-  async listThreads(): Promise<ListThreadsResult<WAMessage>> {
-    return { threads: [] };
+  /** A WhatsApp chat is one flat conversation, so a channel holds just its own thread. */
+  async listThreads(channelId: string): Promise<ListThreadsResult<WAMessage>> {
+    const chat = await this._findChat(this.decodeThreadId(channelId).chatId);
+    return { threads: chat ? this._summaries([chat]) : [] };
+  }
+
+  /** Every chat the account has, newest first, with its latest message: an inbox's list. */
+  async listChats(options?: ListThreadsOptions): Promise<ListThreadsResult<WAMessage>> {
+    const chats = (await this.client.getChats()).filter(
+      (chat) => !isBroadcastId(serialize(chat.id)),
+    );
+    const start = Number(options?.cursor) || 0;
+    const end = start + Math.max(1, options?.limit ?? DEFAULT_LIMIT);
+    return {
+      nextCursor: end < chats.length ? String(end) : undefined,
+      threads: this._summaries(chats.slice(start, end)),
+    };
+  }
+
+  private _summaries(chats: WAChat[]): ThreadSummary<WAMessage>[] {
+    return chats.flatMap((chat) =>
+      chat.lastMessage
+        ? [
+            {
+              id: this.encodeThreadId({ chatId: serialize(chat.id) }),
+              lastReplyAt: new Date(chat.lastMessage.timestamp * 1000),
+              rootMessage: this.parseMessage(chat.lastMessage),
+            },
+          ]
+        : [],
+    );
+  }
+
+  /**
+   * WhatsApp has no modals, so one becomes a conversation: each field is
+   * asked in turn, a select by number, and the answers reach `onModalSubmit`.
+   * `cancel`, or the modal's `closeLabel`, stops it.
+   */
+  async openModal(
+    triggerId: string,
+    modal: ModalElement,
+    contextId?: string,
+  ): Promise<{ viewId: string }> {
+    const [threadId, userId] = fromTrigger(triggerId);
+    const form = createForm(modal, randomUUID(), contextId);
+    await this._start(threadId, userId, modal, form);
+    return { viewId: form.viewId };
   }
 
   async getUser(userId: string): Promise<UserInfo | null> {
@@ -693,7 +815,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     return options;
   }
 
-  private async _connect(): Promise<void> {
+  private async _connect(attempt: number): Promise<void> {
     const timeoutMs = this._config.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timedOut = new Promise<never>((_resolve, reject) => {
@@ -711,8 +833,8 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     try {
       await Promise.race([this._open(), timedOut]);
     } catch (error) {
-      // An abandoned attempt keeps its browser otherwise.
-      await this.client.destroy().catch(() => undefined);
+      // An abandoned attempt keeps its browser otherwise; a superseded one leaves the newer attempt's alone.
+      if (this._owned && attempt === this._attempts) await this._close().catch(() => undefined);
       throw error;
     } finally {
       clearTimeout(timer);
@@ -723,69 +845,131 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
   private async _open(): Promise<void> {
     this._state = this._initialized ? "reconnecting" : "connecting";
-    const ready = new Promise<void>((resolve, reject) => {
-      const onReady = () => settle(resolve);
-      const onFailure = (message: string) =>
-        settle(() =>
-          reject(new ValidationError("wwebjs", `WhatsApp authentication failed: ${message}`)),
-        );
-      const settle = (finish: () => void) => {
-        this.client.off("ready", onReady);
-        this.client.off("auth_failure", onFailure);
-        finish();
-      };
-      this.client.on("ready", onReady);
-      this.client.on("auth_failure", onFailure);
-    });
-    // A previous session's browser is closed first, or every reconnect would leave one running.
-    if (this._initialized) await this.client.destroy().catch(() => undefined);
-    this._initialized = true;
-    await this.client.initialize();
-    if (this._closed) {
-      await this.client.destroy();
-      return;
+    if (!this._owned && (await this._running())) {
+      this._watchBrowser();
+      return this._onReady();
     }
-    // A crashed browser ends the session without WhatsApp ever reporting a disconnect.
-    this.client.pupBrowser?.once("disconnected", () => this._onDisconnected("BROWSER_CLOSED"));
-    await ready;
+    let onReady!: () => void;
+    let onFailure!: (message: string) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      onReady = resolve;
+      onFailure = (message) =>
+        reject(new ValidationError("wwebjs", `WhatsApp authentication failed: ${message}`));
+    });
+    // Rejected while initialize() still runs, before anything awaits it.
+    ready.catch(() => undefined);
+    this.client.on("ready", onReady);
+    this.client.on("auth_failure", onFailure);
+    try {
+      // A previous session's browser is closed first, or every reconnect would leave one running.
+      if (this._owned && this._initialized) await this._close().catch(() => undefined);
+      this._initialized = true;
+      // A client someone else already started is waited on, never started twice.
+      if (this._owned || !this.client.pupBrowser) await this.client.initialize();
+      if (this._closed) {
+        if (this._owned) await this._close();
+        return;
+      }
+      this._watchBrowser();
+      await ready;
+    } finally {
+      this.client.off("ready", onReady);
+      this.client.off("auth_failure", onFailure);
+    }
+  }
+
+  /** A crashed browser ends the session without WhatsApp ever reporting a disconnect. */
+  private _watchBrowser(): void {
+    const browser = this.client.pupBrowser;
+    if (!browser) return;
+    const onClose = () => this._onDisconnected("BROWSER_CLOSED");
+    browser.once("disconnected", onClose);
+    this._unwatch = () => browser.off("disconnected", onClose);
+  }
+
+  /** A client started elsewhere is up when its browser is connected and WhatsApp answers. */
+  private async _running(): Promise<boolean> {
+    if (!this.client.pupBrowser?.isConnected()) return false;
+    return (await within(this.client.getState())) === "CONNECTED";
+  }
+
+  /** Closes the browser this adapter runs; closing it on purpose is not a crash to recover from. */
+  private async _close(): Promise<void> {
+    this._unwatch?.();
+    this._unwatch = undefined;
+    try {
+      await this.client.destroy();
+    } finally {
+      await this._killBrowser();
+    }
+  }
+
+  /** `destroy()` closes only a browser it still sees connected, so one that dropped keeps its profile locked. */
+  private async _killBrowser(): Promise<void> {
+    const browser = this.client.pupBrowser?.process?.();
+    if (!browser?.pid || browser.exitCode !== null || browser.signalCode !== null) return;
+    const exited = once(browser, "exit");
+    try {
+      process.kill(process.platform === "win32" ? browser.pid : -browser.pid, "SIGKILL");
+    } catch {
+      browser.kill("SIGKILL");
+    }
+    // The next browser cannot open the profile until this one is gone.
+    await Promise.race([
+      exited,
+      new Promise((resolve) => setTimeout(resolve, KILL_WAIT_MS).unref?.()),
+    ]);
   }
 
   private _listen(): void {
     const { onPairingCode, onQR } = this._config;
-    if (onQR) this.client.on("qr", (qr) => void onQR(qr));
-    if (onPairingCode) this.client.on("code", (code) => void onPairingCode(code));
+    // Recorded, so a client the adapter only bridges can be handed back without them.
+    const on: Client["on"] = (event: string, listener: Parameters<Client["off"]>[1]) => {
+      this._listeners.push([event, listener]);
+      return this.client.on(event, listener);
+    };
+    if (onQR) on("qr", (qr) => void this._dispatch([onQR], qr, "onQR"));
+    if (onPairingCode)
+      on("code", (code) => void this._dispatch([onPairingCode], code, "onPairingCode"));
 
-    this.client.on("ready", () => {
-      this._state = "connected";
-      this._strikes = 0;
-      if (!this._config.userName && this.client.info?.pushname) {
-        this.userName = this.client.info.pushname;
-      }
-      this._logger.info("WhatsApp session ready", { userId: this.botUserId });
-      void this._learnLid();
-      this._guard("catch-up", this._catchUp());
-    });
-    this.client.on("disconnected", (reason) => this._onDisconnected(String(reason)));
-    this.client.on("message_create", (message) => this._guard("message", this._onMessage(message)));
-    this.client.on("message_edit", (message, _new, previous) =>
-      this._onEdit(message, String(previous)),
-    );
-    this.client.on("message_revoke_everyone", (message, revoked) =>
-      this._onRevoke(message, revoked),
-    );
-    this.client.on("message_reaction", (reaction) => this._onReaction(reaction));
-    this.client.on("message_ack", (message, ack) => this._onAck(message, ack));
-    this.client.on("vote_update", (vote) => this._guard("poll vote", this._onVote(vote)));
-    this.client.on("call", (call) => void this._dispatch(this._callHandlers, call, "onCall"));
+    on("ready", () => this._onReady());
+    on("disconnected", (reason) => this._onDisconnected(String(reason)));
+    on("message_create", (message) => this._guard("message", this._onMessage(message)));
+    on("message_edit", (message, _new, previous) => this._onEdit(message, String(previous)));
+    on("message_revoke_everyone", (message, revoked) => this._onRevoke(message, revoked));
+    on("message_reaction", (reaction) => this._onReaction(reaction));
+    on("message_ack", (message, ack) => this._onAck(message, ack));
+    on("vote_update", (vote) => this._guard("poll vote", this._onVote(vote)));
+    on("call", (call) => void this._dispatch(this._callHandlers, call, "onCall"));
     for (const [event, type] of Object.entries(GROUP_EVENTS)) {
-      this.client.on(event, (notification: GroupNotification) => this._onGroup(type, notification));
+      on(event, (notification: GroupNotification) => this._onGroup(type, notification));
     }
+  }
+
+  private _unlisten(): void {
+    for (const [event, listener] of this._listeners) this.client.off(event, listener);
+    this._listeners = [];
+  }
+
+  private _onReady(): void {
+    this._state = "connected";
+    this._strikes = 0;
+    if (!this._config.userName && this.client.info?.pushname) {
+      this.userName = this.client.info.pushname;
+    }
+    this._logger.info("WhatsApp session ready", { userId: this.botUserId });
+    void this._learnLid();
+    this._guard("catch-up", this._catchUp());
   }
 
   private async _onMessage(raw: WAMessage): Promise<void> {
     if (!this._chat || this._isOwn(raw.fromMe)) return;
     const chatId = chatIdOf(raw);
     if (raw.isStatus || isBroadcastId(chatId) || SYSTEM_TYPES.has(raw.type)) return;
+    const id = serialize(raw.id);
+    if (this._recent.has(id)) return;
+    this._recent.add(id);
+    if (this._recent.size > MAX_RECENT) this._recent.delete(this._recent.values().next().value!);
 
     const threadId = this.encodeThreadId({ chatId });
     if (this._config.markSeen && !raw.fromMe) {
@@ -793,11 +977,148 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
         this._logger.warn("Failed to send a read receipt", { error, threadId }),
       );
     }
+    const author = this._author(raw);
+    if ((await this._answer(raw, threadId, author)) || this._command(raw, threadId, author)) {
+      await this._remember(raw);
+      return;
+    }
     const parsed = this._addons("onMessage").length > 0 ? await this._parse(raw) : undefined;
     if (!parsed || !(await this._claimed(parsed, threadId))) {
       await this._chat.processMessage(this, threadId, parsed ?? (() => this._parse(raw)));
     }
     await this._remember(raw);
+  }
+
+  private _formKey(threadId: string, userId: string): string {
+    return `wwebjs:${this.name}:form:${threadId}:${userId}`;
+  }
+
+  private _texts(): WWebJSModalTexts {
+    return { ...DEFAULT_MODAL_TEXTS, ...this._config.modalTexts };
+  }
+
+  private async _start(
+    threadId: string,
+    userId: string,
+    modal: ModalElement,
+    form: Form,
+  ): Promise<void> {
+    if (!this._chat) throw new ValidationError("wwebjs", "A modal needs Chat to be initialized.");
+    const field = currentField(form);
+    await this._chat.getState().set(this._formKey(threadId, userId), form, FORM_TTL_MS);
+    const intro = introOf(modal, this._texts());
+    await this.postMessage(
+      threadId,
+      field ? `${intro}\n\n${questionOf(field, form, this._texts())}` : intro,
+    );
+  }
+
+  /** A reply from someone filling in a modal answers it, before anything else sees it. */
+  private async _answer(raw: WAMessage, threadId: string, user: Author): Promise<boolean> {
+    const state = this._chat!.getState();
+    const key = this._formKey(threadId, user.userId);
+    const form = await state.get<Form>(key);
+    const field = form && currentField(form);
+    if (!form || !field) return false;
+    const texts = this._texts();
+    const text = (raw.body ?? "").trim();
+    const event = { adapter: this, callbackId: form.callbackId, raw, user, viewId: form.viewId };
+    if (text.toLowerCase() === (form.closeLabel ?? texts.cancel).toLowerCase()) {
+      await state.delete(key);
+      await this.postMessage(threadId, texts.cancelled);
+      if (form.notifyOnClose) {
+        await this._chat!.processModalClose(
+          { ...event, privateMetadata: form.privateMetadata },
+          form.contextId,
+        );
+      }
+      return true;
+    }
+    const answer = answerOf(field, form, text, texts);
+    if ("search" in answer) {
+      const found = flattenOptions(
+        await this._chat!.processOptionsLoad({
+          actionId: field.id,
+          adapter: this,
+          query: answer.search,
+          raw,
+          user,
+        }),
+      );
+      const next = { ...form, found: found.length > 0 ? found : undefined };
+      await state.set(key, next, FORM_TTL_MS);
+      const question = questionOf(field, next, texts);
+      await this.postMessage(
+        threadId,
+        found.length > 0 ? question : `${texts.noResults}\n\n${question}`,
+      );
+      return true;
+    }
+    if ("error" in answer) {
+      await this.postMessage(threadId, `${answer.error}\n\n${questionOf(field, form, texts)}`);
+      return true;
+    }
+    const { [field.id]: _previous, ...rest } = form.values;
+    const next: Form = {
+      ...form,
+      found: undefined,
+      pending: form.pending.slice(1),
+      values: answer.value === undefined ? rest : { ...rest, [field.id]: answer.value },
+    };
+    const following = currentField(next);
+    if (following) {
+      await state.set(key, next, FORM_TTL_MS);
+      await this.postMessage(threadId, questionOf(following, next, texts));
+      return true;
+    }
+    await state.delete(key);
+    const response = await this._chat!.processModalSubmit(
+      { ...event, privateMetadata: next.privateMetadata, values: next.values },
+      next.contextId,
+    );
+    if (response?.action === "errors") {
+      const retry = {
+        ...next,
+        pending: next.fields.map(({ id }) => id).filter((id) => id in response.errors),
+      };
+      const first = currentField(retry);
+      if (first) {
+        await state.set(key, retry, FORM_TTL_MS);
+        const reasons = Object.values(response.errors).join("\n");
+        await this.postMessage(threadId, `${reasons}\n\n${questionOf(first, retry, texts)}`);
+      }
+    } else if (response?.action === "update" || response?.action === "push") {
+      const viewId = response.action === "update" ? next.viewId : randomUUID();
+      await this._start(
+        threadId,
+        user.userId,
+        response.modal,
+        createForm(response.modal, viewId, next.contextId),
+      );
+    }
+    return true;
+  }
+
+  /** WhatsApp has no slash commands, so a message naming a declared one becomes one. */
+  private _command(raw: WAMessage, threadId: string, user: Author): boolean {
+    const match = /^(\/\S+)(?:\s+([\s\S]*))?$/.exec((raw.body ?? "").trim());
+    const command =
+      match &&
+      this._config.slashCommands?.find((name) => name.toLowerCase() === match[1]!.toLowerCase());
+    if (!command) return false;
+    this._chat!.processSlashCommand(
+      {
+        adapter: this,
+        channelId: threadId,
+        command,
+        raw,
+        text: match[2] ?? "",
+        triggerId: triggerIdOf(threadId, user.userId),
+        user,
+      },
+      undefined,
+    );
+    return true;
   }
 
   private async _claimed(message: Message<WAMessage>, threadId: string): Promise<boolean> {
@@ -831,13 +1152,21 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     return this._saving;
   }
 
+  /** While a catch-up runs the position holds still, so a crash part-way replays rather than skips. */
   private async _remember(raw: WAMessage): Promise<void> {
-    if (this._config.catchUpMs === false || !this._seen) return;
+    if (this._config.catchUpMs === false) return;
+    if (this._behind) this._behind.push(raw);
+    else if (this._advance(raw)) await this._save();
+  }
+
+  private _advance(raw: WAMessage): boolean {
+    if (!this._seen) return false;
     const id = serialize(raw.id);
-    const { at, ids } = this._seen;
-    if (raw.timestamp < at || (raw.timestamp === at && ids.includes(id))) return;
-    this._seen = { at: raw.timestamp, ids: raw.timestamp === at ? [...ids, id] : [id] };
-    await this._save();
+    const at = Math.min(raw.timestamp, Math.floor(Date.now() / 1000) + CLOCK_SKEW_S);
+    const { ids } = this._seen;
+    if (at < this._seen.at || (at === this._seen.at && ids.includes(id))) return false;
+    this._seen = { at, ids: at === this._seen.at ? [...ids, id] : [id], wid: this.botUserId };
+    return true;
   }
 
   /** WhatsApp Web loads what arrived while the session was down without announcing every message. */
@@ -846,9 +1175,11 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     const state = this._chat?.getState();
     if (windowMs === false || !state) return;
     this._seen ??= await state.get<Seen>(this._seenKey());
+    // A position recorded for another number, as after pairing a new one, is no position at all.
+    if (this._seen?.wid && this._seen.wid !== this.botUserId) this._seen = null;
     const seen = this._seen;
     if (!seen) {
-      this._seen = { at: Math.floor(Date.now() / 1000), ids: [] };
+      this._seen = { at: Math.floor(Date.now() / 1000), ids: [], wid: this.botUserId };
       await this._save();
       return;
     }
@@ -856,12 +1187,42 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     const unseen = (message: WAMessage) =>
       message.timestamp > oldest ||
       (message.timestamp === seen.at && !seen.ids.includes(serialize(message.id)));
-    const chats = (await this.client.getChats())
-      .filter((chat) => chat.timestamp >= oldest)
-      .slice(0, MAX_CATCH_UP_CHATS);
-    for (const chat of chats) {
-      const missed = (await chat.fetchMessages({ limit: MAX_CATCH_UP_MESSAGES })).filter(unseen);
-      for (const message of missed) await this._onMessage(message);
+    this._behind = [];
+    try {
+      const chats = (await this.client.getChats()).filter((chat) => chat.timestamp >= oldest);
+      const missed: WAMessage[] = [];
+      let truncated = chats.length > MAX_CATCH_UP_CHATS;
+      for (const chat of chats.slice(0, MAX_CATCH_UP_CHATS)) {
+        const messages = await chat
+          .fetchMessages({ limit: MAX_CATCH_UP_MESSAGES })
+          .catch((error: unknown) => {
+            this._logger.warn("Could not catch up on a chat", {
+              chatId: serialize(chat.id),
+              error,
+            });
+            return [];
+          });
+        const behind = messages.filter(unseen);
+        truncated ||= behind.length === MAX_CATCH_UP_MESSAGES;
+        missed.push(...behind);
+      }
+      if (truncated) {
+        this._logger.warn(
+          `Caught up on the ${MAX_CATCH_UP_CHATS} most recent chats and ${MAX_CATCH_UP_MESSAGES} messages each; older ones were missed`,
+        );
+      }
+      for (const message of missed.sort((a, b) => a.timestamp - b.timestamp)) {
+        await this._onMessage(message).catch((error: unknown) =>
+          this._logger.warn("A missed message was not handled", {
+            error,
+            messageId: serialize(message.id),
+          }),
+        );
+      }
+    } finally {
+      const delivered = this._behind;
+      this._behind = undefined;
+      if (delivered.map((message) => this._advance(message)).some(Boolean)) await this._save();
     }
   }
 
@@ -1082,7 +1443,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   private _onDisconnected(reason: string): void {
     if (this._closed) return;
     this._connection = null;
-    this._state = this._config.reconnect === false ? "disconnected" : "reconnecting";
+    this._state = this._reconnects() ? "reconnecting" : "disconnected";
     if (reason === "LOGOUT") {
       this._state = "logged_out";
       this._logger.error("WhatsApp logged this session out; pair it again to reconnect", {
@@ -1094,8 +1455,12 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     this._reconnect(RECONNECT_MIN_MS);
   }
 
+  private _reconnects(): boolean {
+    return this._owned && this._config.reconnect !== false;
+  }
+
   private _reconnect(delayMs: number): void {
-    if (this._closed || this._config.reconnect === false) return;
+    if (this._closed || !this._reconnects()) return;
     clearTimeout(this._retry);
     this._state = "reconnecting";
     this._retry = setTimeout(() => {
@@ -1143,7 +1508,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       const text = addon.renderCard!(card, this._context(threadId));
       if (text !== undefined) return { card, text };
     }
-    return { card, text: cardToFallbackText(card, { boldFormat: "*" }) };
+    return { card, text: cardToText(card) };
   }
 
   /** The card is already on WhatsApp, so an addon failing here must not fail the send. */
@@ -1170,12 +1535,19 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     const { chatId } = this.decodeThreadId(threadId);
     const { card, text: rendered } = this._render(message, threadId);
     const { mentions, text } = extractMentions(rendered);
-    const media = await toMediaList(message, this._config.maxMediaBytes);
+    const media = [
+      ...(await toMediaList(message, this._config.maxMediaBytes)),
+      ...(await Promise.all(
+        (card ? cardImages(card) : []).map((url) =>
+          toMedia({ type: "image", url }, this._config.maxMediaBytes),
+        ),
+      )),
+    ];
     const send: MessageSendOptions = {
       ...options,
       ...(mentions.length > 0 ? { mentions } : {}),
     };
-    const voice = this._config.voiceNotes !== false;
+    const voice = this._config.voiceNotes ?? true;
 
     const captionIndex = text ? media.findIndex(isCaptionable) : -1;
     const payloads: Array<[MessageContent, MessageSendOptions]> = [];
@@ -1184,7 +1556,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       const itemOptions = index === captionIndex ? { ...send, caption: text } : send;
       payloads.push([
         item,
-        voice && isAudio(item) ? { ...itemOptions, sendAudioAsVoice: true } : itemOptions,
+        (voice === "ogg" ? isVoiceNote(item) : voice && isAudio(item))
+          ? { ...itemOptions, sendAudioAsVoice: true }
+          : itemOptions,
       ]);
     });
 
@@ -1272,8 +1646,17 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     return chat;
   }
 
-  private async _requireMessage(messageId: string): Promise<WAMessage> {
+  /** A DM can be addressed by phone or by LID, so only a group's messages must match the thread exactly. */
+  private async _findMessage(messageId: string, threadId?: string): Promise<WAMessage | null> {
     const message = await this.client.getMessageById(messageId).catch(() => null);
+    if (!message || !threadId) return message;
+    const chatId = chatIdOf(message);
+    const expected = this.decodeThreadId(threadId).chatId;
+    return chatId === expected || !(isGroupId(chatId) || isGroupId(expected)) ? message : null;
+  }
+
+  private async _requireMessage(messageId: string, threadId?: string): Promise<WAMessage> {
+    const message = await this._findMessage(messageId, threadId);
     if (!message) {
       throw new ResourceNotFoundError("wwebjs", "message", messageId);
     }
@@ -1288,6 +1671,13 @@ export function createWWebJSAdapter(config: WWebJSAdapterConfig = {}): WWebJSAda
 
 function chatIdOf(message: WAMessage): string {
   return message.id?.remote || (message.fromMe ? message.to : message.from);
+}
+
+/** A location's body is its map thumbnail, base64-encoded, so it reads as the place and a link instead. */
+function locationText({ address, latitude, longitude, name }: WALocation): string {
+  return [name, address, `https://maps.google.com/?q=${latitude},${longitude}`]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function within<T>(lookup: Promise<T>): Promise<T | null> {

@@ -46,6 +46,7 @@ export function toUser(chatId: string): string {
 /**
  * Rewrite Chat SDK mention tokens into WhatsApp's `@number` form and collect
  * the chat IDs WhatsApp needs alongside the body to render them as mentions.
+ * A bare `@number` stays text, so echoing what someone wrote pings no one.
  */
 export function extractMentions(text: string): { mentions: string[]; text: string } {
   const mentions = new Set<string>();
@@ -54,9 +55,5 @@ export function extractMentions(text: string): { mentions: string[]; text: strin
     mentions.add(chatId);
     return `@${toUser(chatId)}`;
   });
-  const named = new Set([...mentions].map(toUser));
-  for (const [, user] of rendered.matchAll(/@(\d{6,})\b/g)) {
-    if (user && !named.has(user)) mentions.add(`${user}${USER_SUFFIX}`);
-  }
   return { mentions: [...mentions], text: rendered };
 }

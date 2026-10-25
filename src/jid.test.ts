@@ -35,14 +35,14 @@ describe("jid", () => {
       expect(result.mentions).toEqual(["15551234567@c.us"]);
     });
 
-    it("picks up plain @number mentions the user typed", () => {
+    it("leaves a plain @number as text, so echoing what someone wrote pings no one", () => {
       const result = extractMentions("cc @15559876543");
       expect(result.text).toBe("cc @15559876543");
-      expect(result.mentions).toEqual(["15559876543@c.us"]);
+      expect(result.mentions).toEqual([]);
     });
 
-    it("deduplicates a user mentioned in both forms", () => {
-      const result = extractMentions("<@15551234567@c.us> and again @15551234567");
+    it("mentions a user once, however often the token appears", () => {
+      const result = extractMentions("<@15551234567@c.us> and again <@15551234567>");
       expect(result.mentions).toEqual(["15551234567@c.us"]);
     });
 

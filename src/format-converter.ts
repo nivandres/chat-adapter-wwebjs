@@ -1,13 +1,18 @@
 import {
   BaseFormatConverter,
+  chartElementToFallbackText,
   getNodeChildren,
   parseMarkdown,
+  tableElementToAscii,
   tableToAscii,
+  type CardChild,
+  type CardElement,
   type Content,
   type Root,
 } from "chat";
 
 const MAX_MARKDOWN_LENGTH = 16_000;
+const DIVIDER = "──────────";
 
 function plain(value: string): Root {
   return { children: [{ children: [{ type: "text", value }], type: "paragraph" }], type: "root" };
@@ -75,7 +80,7 @@ export class WWebJSFormatConverter extends BaseFormatConverter {
       case "table":
         return `\`\`\`\n${tableToAscii(node)}\n\`\`\``;
       case "thematicBreak":
-        return "──────────";
+        return DIVIDER;
       default:
         return this.defaultNodeToText(node, (child) => this.toWhatsApp(child));
     }
@@ -86,4 +91,45 @@ export class WWebJSFormatConverter extends BaseFormatConverter {
       .map((child) => this.toWhatsApp(child))
       .join(separator);
   }
+}
+
+function childText(child: CardChild): string {
+  switch (child.type) {
+    case "text":
+      return child.style === "bold"
+        ? `*${child.content}*`
+        : child.style === "muted"
+          ? `_${child.content}_`
+          : child.content;
+    case "link":
+      return `${child.label}: ${child.url}`;
+    case "fields":
+      return child.children.map(({ label, value }) => `*${label}:* ${value}`).join("\n");
+    case "table":
+      return `\`\`\`\n${tableElementToAscii(child.headers, child.rows)}\n\`\`\``;
+    case "chart":
+      return chartElementToFallbackText(child);
+    case "section":
+      return child.children.map(childText).filter(Boolean).join("\n");
+    case "divider":
+      return DIVIDER;
+    default:
+      return "";
+  }
+}
+
+/** A card in WhatsApp's markup. Its images go out as media, and its buttons are an addon's to render. */
+export function cardToText(card: CardElement): string {
+  return [card.title && `*${card.title}*`, card.subtitle, ...card.children.map(childText)]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** Every image a card carries, its header first. */
+export function cardImages(card: CardElement): string[] {
+  const inside = (children: CardChild[]): string[] =>
+    children.flatMap((child) =>
+      child.type === "image" ? [child.url] : child.type === "section" ? inside(child.children) : [],
+    );
+  return [...(card.imageUrl ? [card.imageUrl] : []), ...inside(card.children)];
 }

@@ -57,6 +57,21 @@ describe("closeOnSignal", () => {
     await vi.waitFor(() => expect(kill).toHaveBeenCalledWith(process.pid, "SIGTERM"));
   });
 
+  it("ends the process in time even when a session never finishes closing", async () => {
+    vi.useFakeTimers();
+    try {
+      const { closeOnSignal } = await import("./shutdown");
+      closeOnSignal(() => new Promise(() => {}));
+
+      process.emit("SIGTERM", "SIGTERM");
+      await vi.advanceTimersByTimeAsync(8_000);
+
+      expect(kill).toHaveBeenCalledWith(process.pid, "SIGTERM");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("stops listening once the last session is gone", async () => {
     const { closeOnSignal } = await import("./shutdown");
     const first = closeOnSignal(async () => undefined);

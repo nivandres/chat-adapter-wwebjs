@@ -1,7 +1,13 @@
+import { downloadAttachment } from "@chat-adapter/shared";
 import type { Attachment } from "chat";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { download, isCaptionable, toAttachments, toMedia, toMediaList } from "./media";
+import { download, isCaptionable, isVoiceNote, toAttachments, toMedia, toMediaList } from "./media";
 import { MessageMedia } from "./wwebjs";
+
+vi.mock("@chat-adapter/shared", async (original) => {
+  const shared = await original<typeof import("@chat-adapter/shared")>();
+  return { ...shared, downloadAttachment: vi.fn(shared.downloadAttachment) };
+});
 
 function waMessage(overrides: Record<string, unknown> = {}) {
   return {
@@ -137,37 +143,31 @@ describe("toMedia", () => {
     expect((await toMedia(attachment)).data).toBe(base64("lazy"));
   });
 
-  it("fetches a URL-only attachment, typed by the response", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("remote", { headers: { "content-type": "image/png" } })),
-    );
-    const media = await toMedia({ type: "image", url: "https://example.com/a.png" });
+  it("fetches a URL-only attachment within the size limit, typed by the response", async () => {
+    vi.mocked(downloadAttachment).mockImplementationOnce(async (_url, options) => {
+      options.onResponse?.({ headers: { "content-type": "image/png; q=1" } } as never);
+      return Buffer.from("remote");
+    });
+    const media = await toMedia({ type: "image", url: "https://example.com/a.png" }, 4096);
     expect(media).toMatchObject({
       data: base64("remote"),
       filename: "a.png",
       mimetype: "image/png",
     });
-  });
-
-  it("refuses a URL that answers with an error rather than sending the error page", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("INTERNAL-SECRET", { status: 500 })),
-    );
-    await expect(toMedia({ type: "image", url: "https://example.com/a.png" })).rejects.toThrow(
-      "HTTP 500",
+    expect(downloadAttachment).toHaveBeenCalledWith(
+      "https://example.com/a.png",
+      expect.objectContaining({ adapter: "wwebjs", limit: 4096 }),
     );
   });
 
-  it("stops reading a URL past the size limit", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("x".repeat(10))),
-    );
-    await expect(toMedia({ type: "image", url: "https://example.com/a.png" }, 4)).rejects.toThrow(
-      "over the 4-byte limit",
-    );
+  it("never fetches from a private address or over plain HTTP", async () => {
+    for (const url of [
+      "https://127.0.0.1/a.png",
+      "https://169.254.169.254/latest",
+      "http://example.com/a.png",
+    ]) {
+      await expect(toMedia({ type: "image", url })).rejects.toThrow();
+    }
   });
 
   it("never takes a MIME type from the object prototype", async () => {
@@ -201,6 +201,14 @@ describe("download", () => {
     await expect(download(message, 8)).rejects.toThrow("over the 8-byte limit");
   });
 
+  it("refuses a blob WhatsApp reports as too large before streaming it", async () => {
+    const message = waMessage({
+      downloadMediaStream: vi.fn(async () => ({ ...stream(4), blobSize: 9 })),
+      hasMedia: true,
+    });
+    await expect(download(message, 8)).rejects.toThrow("9 bytes or more, over the 8-byte limit");
+  });
+
   it("returns the streamed bytes when they fit", async () => {
     const message = waMessage({
       downloadMediaStream: vi.fn(async () => stream(6)),
@@ -232,6 +240,13 @@ describe("toMediaList", () => {
 
   it("returns nothing for a plain string message", async () => {
     expect(await toMediaList("hello")).toEqual([]);
+  });
+});
+
+describe("isVoiceNote", () => {
+  it("is true only for OGG audio, which every phone plays as a voice note", () => {
+    expect(isVoiceNote(new MessageMedia("audio/ogg; codecs=opus", ""))).toBe(true);
+    expect(isVoiceNote(new MessageMedia("audio/mpeg", ""))).toBe(false);
   });
 });
 
