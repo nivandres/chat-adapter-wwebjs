@@ -110,6 +110,7 @@ function fakeClient(overrides: Record<string, unknown> = {}) {
     getState: vi.fn(async () => "CONNECTED"),
     info: { pushname: "Bot", wid: { _serialized: BOT } },
     initialize: vi.fn(async () => undefined),
+    options: { puppeteer: {} as { signal?: AbortSignal } },
     searchMessages: vi.fn(async () => []),
     sendMessage: vi.fn(async (chatId: string, _content?: unknown, _options?: MessageSendOptions) =>
       waMessage({ fromMe: true, messageId: "SENT", remote: chatId }),
@@ -1610,6 +1611,18 @@ describe("WWebJSAdapter", () => {
         expect(bridged.client.destroy).not.toHaveBeenCalled();
       });
 
+      it("keeps no hold on the browser of a client it only bridges, even one it started", async () => {
+        const { adapter, client } = await connected({ manageClient: false });
+        const attempt = adapter.connect();
+        await vi.waitFor(() => expect(client.initialize).toHaveBeenCalledOnce());
+        client.emit("ready");
+        await attempt;
+        await adapter.disconnect();
+
+        expect(client.options.puppeteer.signal).toBeUndefined();
+        expect(client.destroy).not.toHaveBeenCalled();
+      });
+
       it("leaves its lifecycle to you: no reconnect, no destroy, no signals", async () => {
         const before = process.listenerCount("SIGTERM");
         const own = vi.fn();
@@ -1783,6 +1796,33 @@ describe("WWebJSAdapter", () => {
           await adapter.disconnect();
 
           expect(kill).toHaveBeenCalledWith(-4242, "SIGKILL");
+          kill.mockRestore();
+        });
+
+        it("is ended even when whatsapp-web.js never handed it over", async () => {
+          const { browser, kill } = browserWith({ exitCode: 0 });
+          const { adapter, client } = await connected(
+            { connectTimeoutMs: 10_000 },
+            { pupBrowser: browser },
+          );
+          const first = adapter.connect();
+          client.emit("ready");
+          await first;
+          // Puppeteer launches under the signal it is given, and this attempt stalls before the browser is handed over.
+          const launches: Array<AbortSignal | undefined> = [];
+          client.initialize.mockImplementation(() => {
+            launches.push(client.options.puppeteer.signal);
+            return new Promise(() => {});
+          });
+
+          browser.emit("disconnected");
+          await vi.advanceTimersByTimeAsync(5_000 + 10_000);
+          expect(launches[0]?.aborted).toBe(true);
+
+          await vi.advanceTimersByTimeAsync(10_000);
+          expect(launches).toHaveLength(2);
+          expect(launches[1]?.aborted).toBe(false);
+          expect(kill).not.toHaveBeenCalled();
           kill.mockRestore();
         });
       });

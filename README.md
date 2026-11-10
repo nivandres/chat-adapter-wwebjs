@@ -395,7 +395,8 @@ Examples: `wwebjs:15551234567@c.us` (DM by phone), `wwebjs:99990000111122@lid` (
 
 ### "The browser is already running"
 
-- Another process holds the same `LocalAuth` profile. The adapter ends the browser it runs before reopening; a client you started yourself is yours to close.
+- Another process holds the same `LocalAuth` profile. The adapter ends every browser it launches before reopening, even one whatsapp-web.js never handed over; a client you started yourself is yours to close.
+- A process killed outright, by `kill -9` or the OOM killer, leaves its browser running. End it before starting again: on Linux and macOS the profile's `SingletonLock` points at `<host>-<pid>`.
 
 ### The session drops
 

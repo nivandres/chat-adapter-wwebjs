@@ -32,6 +32,7 @@ import {
 import type {
   Chat as WAChat,
   Client,
+  ClientOptions,
   GroupChat,
   GroupNotification,
   Location as WALocation,
@@ -223,6 +224,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   private _strikes = 0;
   private readonly _owned: boolean;
   private _attempts = 0;
+  private _launch?: AbortController;
   private _unwatch?: () => void;
   private _listeners: Array<Parameters<Client["off"]>> = [];
   private _unsignal?: () => void;
@@ -883,6 +885,12 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       // A previous session's browser is closed first, or every reconnect would leave one running.
       if (this._owned && this._initialized) await this._close().catch(() => undefined);
       this._initialized = true;
+      if (this._owned) {
+        // whatsapp-web.js hands its browser over only once the page is set up, if ever; Puppeteer ends it on this signal from launch on.
+        this._launch = new AbortController();
+        const options = (this.client as unknown as { options: ClientOptions }).options;
+        options.puppeteer = { ...options.puppeteer, signal: this._launch.signal };
+      }
       // A client someone else already started is waited on, never started twice.
       if (this._owned || !this.client.pupBrowser) await this.client.initialize();
       if (this._closed) {
@@ -925,6 +933,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
   /** `destroy()` closes only a browser it still sees connected, so one that dropped keeps its profile locked. */
   private async _killBrowser(): Promise<void> {
+    this._launch?.abort();
     const browser = this.client.pupBrowser?.process?.();
     if (!browser?.pid || browser.exitCode !== null || browser.signalCode !== null) return;
     const exited = once(browser, "exit");
