@@ -279,8 +279,8 @@ describe("WWebJSAdapter", () => {
       expect(adapter.parseMessage(waMessage({ mentionedIds: [BOT] })).isMention).toBe(true);
       expect(
         adapter.parseMessage(waMessage({ mentionedIds: ["15559999999@c.us"] })).isMention,
-      ).toBe(false);
-      expect(adapter.parseMessage(waMessage()).isMention).toBe(false);
+      ).toBeUndefined();
+      expect(adapter.parseMessage(waMessage()).isMention).toBeUndefined();
     });
 
     it("matches a mention across WhatsApp ID namespaces", () => {
@@ -306,7 +306,7 @@ describe("WWebJSAdapter", () => {
       ).toBe(true);
       expect(
         adapter.parseMessage(waMessage({ mentionedIds: [{ $1: "11223344@lid" }] })).isMention,
-      ).toBe(false);
+      ).toBeUndefined();
     });
 
     it("writes a mention of the bot as its name, not its LID", async () => {
@@ -376,11 +376,19 @@ describe("WWebJSAdapter", () => {
           children: [
             Image({ url: "https://example.com/a.png" }),
             Fields([Field({ label: "Order", value: "#42" })]),
+            Actions([
+              Button({ id: "refund", label: "Refund" }),
+              LinkButton({ label: "Track", url: "https://example.com/t" }),
+            ]),
           ],
           title: "Receipt",
         }),
       );
-      expect(client.sendMessage).toHaveBeenCalledWith(ALICE, "Receipt\nOrder: #42", {});
+      expect(client.sendMessage).toHaveBeenCalledWith(
+        ALICE,
+        "Receipt\nOrder: #42\nTrack: https://example.com/t",
+        {},
+      );
       expect(downloadAttachment).not.toHaveBeenCalled();
       expect(adapter.openModal).toBeUndefined();
     });
@@ -393,13 +401,19 @@ describe("WWebJSAdapter", () => {
           children: [
             CardText("Shipped", { style: "bold" }),
             Fields([Field({ label: "Order", value: "#42" })]),
+            Actions([
+              Button({ id: "refund", label: "Refund" }),
+              LinkButton({ label: "Track", url: "https://example.com/t" }),
+            ]),
             Table({ headers: ["Item", "Qty"], rows: [["Tea", "2"]] }),
           ],
           title: "Receipt",
         }),
       );
       const text = String(client.sendMessage.mock.calls[0]![1]);
-      expect(text).toContain("*Receipt*\n*Shipped*\n*Order:* #42\n```");
+      expect(text).toContain(
+        "*Receipt*\n*Shipped*\n*Order:* #42\nTrack: https://example.com/t\n```",
+      );
       expect(text).toMatch(/```\n.*Item.*Qty[\s\S]*Tea[\s\S]*```$/);
     });
 
@@ -2197,8 +2211,8 @@ describe("WWebJSAdapter", () => {
       title: "Order",
     });
 
-    async function withAddon(options = {}) {
-      const context = await connected({ addons: [numberedActions(options)] });
+    async function withAddon(options = {}, config = {}) {
+      const context = await connected({ addons: [numberedActions(options)], ...config });
       await context.adapter.postMessage(THREAD, card);
       return context;
     }
@@ -2206,7 +2220,14 @@ describe("WWebJSAdapter", () => {
     it("lists a card's buttons and select options by number, keeping links as links", async () => {
       const { client } = await withAddon();
       expect(client.sendMessage.mock.calls[0]![1]).toBe(
-        "*Order*\n\n1. Approve\nDocs: https://example.com/docs\n*Size*\n2. Small\n3. Large",
+        "Order\nDocs: https://example.com/docs\n\n1. Approve\nSize\n2. Small\n3. Large",
+      );
+    });
+
+    it("keeps the card in WhatsApp's markup with richContent", async () => {
+      const { client } = await withAddon({}, { richContent: true });
+      expect(client.sendMessage.mock.calls[0]![1]).toBe(
+        "*Order*\nDocs: https://example.com/docs\n\n1. Approve\n*Size*\n2. Small\n3. Large",
       );
     });
 
@@ -2459,6 +2480,24 @@ describe("WWebJSAdapter", () => {
       expect(lastSent(client)).toBe("Cancelled.");
       say(client, "after", "X2");
       await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledOnce());
+    });
+
+    it("stops on its closeLabel as well as on cancel", async () => {
+      const { adapter, client } = await connected({ richContent: true });
+      const modal = Modal({
+        callbackId: "x",
+        children: [TextInput({ id: "a", label: "A" })],
+        closeLabel: "Salir",
+        title: "T",
+      });
+      for (const [word, id] of [
+        ["salir", "C1"],
+        ["cancel", "C2"],
+      ] as const) {
+        await adapter.openModal!(triggerIdOf(THREAD, ALICE), modal);
+        say(client, word, id);
+        await vi.waitFor(() => expect(lastSent(client)).toBe("Cancelled."));
+      }
     });
 
     it("speaks the language it is given, and refuses a trigger it never issued", async () => {

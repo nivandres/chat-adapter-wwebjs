@@ -200,6 +200,8 @@ export interface WWebJSAddonContext {
   adapter: WWebJSAdapter;
   /** Absent until the Chat SDK has initialized the adapter. */
   chat: ChatInstance | null;
+  /** Whether cards use WhatsApp's markup; see {@link WWebJSAdapterConfig.richContent}. */
+  richContent: boolean;
   threadId: string;
 }
 

@@ -6,6 +6,7 @@ import {
   parseMarkdown,
   tableElementToAscii,
   tableToAscii,
+  type ActionsElement,
   type CardChild,
   type CardElement,
   type Content,
@@ -112,6 +113,8 @@ function childText(child: CardChild): string {
       return chartElementToFallbackText(child);
     case "section":
       return child.children.map(childText).filter(Boolean).join("\n");
+    case "actions":
+      return linkButtons(child);
     case "divider":
       return DIVIDER;
     default:
@@ -119,18 +122,28 @@ function childText(child: CardChild): string {
   }
 }
 
-/** A card in WhatsApp's markup. Its images go out as media, and its buttons are an addon's to render. */
+function linkButtons(child: ActionsElement): string {
+  return child.children
+    .flatMap((action) => (action.type === "link-button" ? [`${action.label}: ${action.url}`] : []))
+    .join("\n");
+}
+
+function plainText(child: CardChild): string | null {
+  if (child.type === "actions") return linkButtons(child);
+  if (child.type === "section") return child.children.map(plainText).filter(Boolean).join("\n");
+  return cardChildToFallbackText(child);
+}
+
+/** A card in WhatsApp's markup. Its images go out as media, its link buttons as `Label: url` lines, and its other buttons are an addon's to render. */
 export function cardToText(card: CardElement): string {
   return [card.title && `*${card.title}*`, card.subtitle, ...card.children.map(childText)]
     .filter(Boolean)
     .join("\n");
 }
 
-/** A card as plain lines, for a channel that should not imitate one. */
+/** A card as plain lines, for a channel that should not imitate one. Link buttons keep their URL. */
 export function cardToPlainText(card: CardElement): string {
-  return [card.title, card.subtitle, ...card.children.map(cardChildToFallbackText)]
-    .filter(Boolean)
-    .join("\n");
+  return [card.title, card.subtitle, ...card.children.map(plainText)].filter(Boolean).join("\n");
 }
 
 /** Every image a card carries, its header first. */

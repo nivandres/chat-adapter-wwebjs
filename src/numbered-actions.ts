@@ -1,5 +1,5 @@
 import type { ActionsElement, CardChild, CardElement } from "chat";
-import { cardToText } from "./format-converter.js";
+import { cardToPlainText, cardToText } from "./format-converter.js";
 import { triggerIdOf } from "./modals.js";
 import type { WWebJSAddon, WWebJSAddonContext } from "./types.js";
 
@@ -30,8 +30,8 @@ function actionsOf(children: CardChild[]): ActionsElement[] {
   );
 }
 
-/** Buttons and select options as numbered lines; a link button keeps its URL, and a modal cannot open on WhatsApp. */
-function layout(card: CardElement): { choices: Choice[]; lines: string[] } {
+/** Buttons and select options as numbered lines; a link button is the card's own line, and a modal cannot open on WhatsApp. */
+function layout(card: CardElement, richContent: boolean): { choices: Choice[]; lines: string[] } {
   const choices: Choice[] = [];
   const lines: string[] = [];
   const offer = (choice: Choice) => {
@@ -40,13 +40,12 @@ function layout(card: CardElement): { choices: Choice[]; lines: string[] } {
   };
   for (const { children } of actionsOf(card.children)) {
     for (const action of children) {
-      if (action.type === "link-button") lines.push(`${action.label}: ${action.url}`);
-      else if (action.type === "button") {
+      if (action.type === "button") {
         if (!action.disabled && action.actionType !== "modal") {
           offer({ actionId: action.id, label: action.label, value: action.value });
         }
-      } else {
-        lines.push(`*${action.label}*`);
+      } else if (action.type !== "link-button") {
+        lines.push(richContent ? `*${action.label}*` : action.label);
         for (const option of action.options) {
           offer({ actionId: action.id, label: option.label, value: option.value });
         }
@@ -66,13 +65,14 @@ function keyOf({ adapter, threadId }: WWebJSAddonContext): string {
  */
 export function numberedActions(options: NumberedActionsOptions = {}): WWebJSAddon {
   return {
-    renderCard(card) {
-      const { lines } = layout(card);
+    renderCard(card, { richContent }) {
+      const { lines } = layout(card, richContent);
       if (lines.length === 0) return undefined;
-      return [cardToText(card), lines.join("\n")].filter(Boolean).join("\n\n");
+      const text = richContent ? cardToText(card) : cardToPlainText(card);
+      return [text, lines.join("\n")].filter(Boolean).join("\n\n");
     },
     async cardSent(card, messageId, context) {
-      const { choices } = layout(card);
+      const { choices } = layout(card, context.richContent);
       if (choices.length === 0 || !context.chat) return;
       await context.chat
         .getState()

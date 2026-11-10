@@ -1,5 +1,17 @@
 # chat-adapter-wwebjs
 
+## 0.1.4
+
+### Changed
+
+- A card answered by number with `numberedActions()` follows `richContent` like any other card: plain lines unless it is on. It used WhatsApp's markup either way. Addons read the setting from their context's `richContent`.
+
+### Fixed
+
+- A group message that names the bot as `@` and its `userName`, without a WhatsApp mention, went unnoticed under Chat SDK 4.44, which takes an adapter's `false` as final. The adapter now flags only the mentions WhatsApp marks and leaves the rest for the SDK to detect.
+- A card's link buttons were dropped unless `numberedActions()` listed them. They now go out as `Label: url` lines in every card.
+- A modal with a `closeLabel` stopped only on that word, although its hint tells people to send _cancel_. Either now stops it.
+
 ## 0.1.3
 
 ### Added

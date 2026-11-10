@@ -370,7 +370,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       author: this._author(raw),
       formatted: this._converter.toAst(text),
       id: serialize(raw.id),
-      isMention: this._mentionsBot(raw),
+      isMention: this._mentionsBot(raw) || undefined,
       links: (raw.links ?? []).map(({ link }) => ({ url: link })),
       metadata: {
         dateSent: new Date(raw.timestamp * 1000),
@@ -1051,7 +1051,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     const texts = this._texts();
     const text = (raw.body ?? "").trim();
     const event = { adapter: this, callbackId: form.callbackId, raw, user, viewId: form.viewId };
-    if (text.toLowerCase() === (form.closeLabel ?? texts.cancel).toLowerCase()) {
+    if (
+      [texts.cancel, form.closeLabel].some((word) => word?.toLowerCase() === text.toLowerCase())
+    ) {
       await state.delete(key);
       await this.postMessage(threadId, texts.cancelled);
       if (form.notifyOnClose) {
@@ -1161,7 +1163,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   }
 
   private _context(threadId: string): WWebJSAddonContext {
-    return { adapter: this, chat: this._chat, threadId };
+    return { adapter: this, chat: this._chat, richContent: !!this._config.richContent, threadId };
   }
 
   private _seenKey(): string {

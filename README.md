@@ -220,7 +220,7 @@ Anything not wrapped is still reachable through `adapter.client`.
 
 ## Card actions
 
-WhatsApp Web cannot send buttons, so a card's buttons would be dropped from its text. Add `numberedActions()` and they are listed by number instead, select options included, and a reply with a number — or a label — reaches `onAction` as a click would. Link buttons keep their URL; a button that opens a modal is left out, since WhatsApp has none.
+WhatsApp Web cannot send buttons, so a card's buttons would be dropped from its text. Add `numberedActions()` and they are listed by number instead, select options included, and a reply with a number — or a label — reaches `onAction` as a click would. The card's text follows `richContent`, and a button that opens a modal is left out, since WhatsApp has none.
 
 ```typescript
 import { createWWebJSAdapter, numberedActions } from "chat-adapter-wwebjs";
@@ -238,7 +238,7 @@ An addon is a plain object with optional `renderCard`, `cardSent` and `onMessage
 
 ## Rich content
 
-WhatsApp Web has no cards, buttons or modals, so the adapter can only imitate them, and by default it doesn't: a card goes out as plain lines, and the adapter has no `openModal`, so `event.openModal()` resolves to `undefined` and your bot can tell. Set `richContent: true` to imitate them: cards in WhatsApp's markup, a bold title, `*Label:* value` fields and monospaced tables, with their images sent as media and the card as caption, and [modals](#modals) as conversations. Buttons answered by number are a separate opt-in, [`numberedActions()`](#card-actions).
+WhatsApp Web has no cards, buttons or modals, so the adapter can only imitate them, and by default it doesn't: a card goes out as plain lines, its link buttons as `Label: url`, and the adapter has no `openModal`, so `event.openModal()` resolves to `undefined` and your bot can tell. Set `richContent: true` to imitate them: cards in WhatsApp's markup, a bold title, `*Label:* value` fields and monospaced tables, with their images sent as media and the card as caption, and [modals](#modals) as conversations. Buttons answered by number are a separate opt-in, [`numberedActions()`](#card-actions).
 
 ## Streaming
 
@@ -296,7 +296,7 @@ bot.onModalSubmit("booking", (event) =>
 | `Select`, `RadioSelect` | An option's number or label                                                    |
 | `ExternalSelect`        | Words to search, which reach `onOptionsLoad`, then a number from what it found |
 
-An optional field, or one with an initial value, can be answered _skip_. _cancel_, or the modal's `closeLabel`, stops it, and reaches `onModalClose` when the modal sets `notifyOnClose`. An answer that doesn't fit is asked again with the reason. When every field is answered, `onModalSubmit` receives the values: return `{ action: "errors", errors }` and only those fields are asked again, with your messages; return `{ action: "update", modal }` or `{ action: "push", modal }` and the new modal starts. A modal left unanswered stops waiting after a day.
+An optional field, or one with an initial value, can be answered _skip_. _cancel_, or the modal's `closeLabel`, stops it, and reaches `onModalClose` when the modal sets `notifyOnClose`. An answer that doesn't fit is asked again. When every field is answered, `onModalSubmit` receives the values: return `{ action: "errors", errors }` and only those fields are asked again, with your messages; return `{ action: "update", modal }` or `{ action: "push", modal }` and the new modal starts. A modal left unanswered stops waiting after a day.
 
 Modals open from actions — `numberedActions()` answers carry a trigger — and from slash commands. To open one for someone without either, pass `triggerIdOf(threadId, userId)` to `adapter.openModal()`. Put the phrases a modal sends in your users' language with `modalTexts`:
 
@@ -407,7 +407,7 @@ Examples: `wwebjs:15551234567@c.us` (DM by phone), `wwebjs:99990000111122@lid` (
 - **Unofficial.** It automates WhatsApp Web, which WhatsApp may block or change at any time.
 - **One session per number**, as WhatsApp Web itself allows.
 - **No scheduling or ephemeral messages.** `postEphemeral` falls back to a DM; `thread.schedule()` throws.
-- **`receiveOwnMessages` includes the adapter's own sends.** Turn it on only if your handlers can tell them apart.
+- **Everything the paired account sends counts as the bot's own**, from the phone too, so the Chat SDK skips its messages, edits and reactions even with `receiveOwnMessages`; only its deletes come through.
 - **An attachment given only by `url` is fetched over HTTPS**, never from a private or internal address, with a 30-second timeout and `maxMediaBytes` as its limit.
 - **A bare `@number` in outgoing text stays text.** Mention someone with `thread.mentionUser(id)`.
 - **`forwardMessage` and event call links fail on current WhatsApp Web.** whatsapp-web.js still calls modules WhatsApp has renamed; both return once it catches up. `sendEvent` without `callType` attaches no link and works.
