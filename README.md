@@ -22,12 +22,20 @@ Documentation: [chat-sdk.dev/adapters/community/wwebjs](https://chat-sdk.dev/ada
 ## Installation
 
 ```bash
-pnpm add chat-adapter-wwebjs whatsapp-web.js chat @chat-adapter/shared
+pnpm add chat-adapter-wwebjs chat @chat-adapter/shared github:pedroslopez/whatsapp-web.js#064a3d5
 ```
 
-ESM only, Node >= 20. `chat`, `@chat-adapter/shared` and `whatsapp-web.js` are peers, so you control their versions. whatsapp-web.js downloads a Chromium build through Puppeteer on install.
+ESM only, Node >= 20. `chat`, `@chat-adapter/shared` and `whatsapp-web.js` are peers, so you control their versions. WhatsApp Web renamed the IDs whatsapp-web.js reads, and 1.34.7 cannot send or find chats since, so until a release carries the fix, install the commit this adapter is tested against, as above.
 
-WhatsApp Web renamed the IDs whatsapp-web.js reads, and 1.34.7 cannot send or find chats since. Until a release carries the fix, install the commit this adapter is tested against: `pnpm add github:pedroslopez/whatsapp-web.js#064a3d5`.
+whatsapp-web.js builds when installed from GitHub, and Puppeteer downloads a Chromium build on install. pnpm 10 and later run those scripts only when you allow them, in `pnpm-workspace.yaml`:
+
+```yaml
+onlyBuiltDependencies:
+  - whatsapp-web.js
+  - puppeteer
+```
+
+pnpm pins the commit in the lockfile rather than in `package.json`, so commit the lockfile.
 
 ## Usage
 
@@ -36,7 +44,9 @@ import { createMemoryState } from "@chat-adapter/state-memory";
 import { Chat } from "chat";
 import { createWWebJSAdapter } from "chat-adapter-wwebjs";
 import qrcode from "qrcode-terminal";
-import { LocalAuth } from "whatsapp-web.js";
+import wwebjs from "whatsapp-web.js";
+
+const { LocalAuth } = wwebjs;
 
 const whatsapp = createWWebJSAdapter({
   adapterName: "whatsapp",
@@ -75,7 +85,7 @@ Puppeteer's bundled Chromium covers most machines. On slim Linux images install 
 
 ### 2. Keep the session
 
-Pick an auth strategy from whatsapp-web.js. `LocalAuth` stores the session in a directory, `RemoteAuth` in a store you provide. Persist it, or you scan again on every start.
+Pick an auth strategy from whatsapp-web.js. `LocalAuth` stores the session in a directory, `RemoteAuth` in a store you provide. Persist it, or you scan again on every start. The session signs in as your WhatsApp account, so keep its directory out of version control, for example by adding `.wwebjs-auth` to `.gitignore`.
 
 ### 3. Link the device
 

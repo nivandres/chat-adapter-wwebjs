@@ -2,7 +2,9 @@ import { MemoryStateAdapter } from "@chat-adapter/state-memory";
 import { Chat } from "chat";
 import { createWWebJSAdapter, requireWWebJSAdapter } from "chat-adapter-wwebjs";
 import qrcode from "qrcode-terminal";
-import { LocalAuth } from "whatsapp-web.js";
+import wwebjs from "whatsapp-web.js";
+
+const { LocalAuth } = wwebjs;
 
 const whatsapp = createWWebJSAdapter({
   adapterName: "whatsapp",

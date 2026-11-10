@@ -1,5 +1,13 @@
 # chat-adapter-wwebjs
 
+## 0.1.5
+
+### Fixed
+
+- The README and the example imported `LocalAuth` by name, which throws under Node: whatsapp-web.js is CommonJS, so ESM sees only its default export. They now import it as `wwebjs` and take `LocalAuth` from it.
+- The README's install failed on pnpm 10, which refuses to build whatsapp-web.js from GitHub and skips Puppeteer's Chromium download until both are allowed in `onlyBuiltDependencies`. It now installs the tested commit in one command and says how to allow both.
+- The README now warns that the `LocalAuth` directory signs in as your WhatsApp account and belongs out of version control.
+
 ## 0.1.4
 
 ### Changed
