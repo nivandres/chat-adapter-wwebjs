@@ -3,12 +3,12 @@ updates:
   - package-ecosystem: bun
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    labels: [dependencies]
     groups:
       vitest:
         patterns: [vitest, "@vitest/*"]
-      development:
-        dependency-type: development
+      minor-and-patch:
         update-types: [minor, patch]
     ignore:
       - dependency-name: whatsapp-web.js
@@ -17,4 +17,5 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    labels: [dependencies]
