@@ -1,5 +1,21 @@
 # chat-adapter-wwebjs
 
+## 0.2.0
+
+### Changed
+
+- With `receiveOwnMessages`, what the account's owner does on the phone or another linked device reaches your handlers as a person's: `isMe` and `isBot` are `false` and the author is `botUserId`, so `message.author.userId === adapter.botUserId` tells them apart. Everything the account sent used to count as the bot's own, so the Chat SDK skipped its messages, edits, reactions and commands, and only its deletes came through. What the adapter itself sends stays its own, even when WhatsApp echoes a send before it returns: its messages, an edit of one, a reaction it made and a forward. Its messages are recorded in the Chat SDK state for as long as `catchUpMs` reaches back, so catching up after a restart never hands the bot its own; from a position recorded before 0.2.0 or with the option off, which kept no such record, it skips the account's messages altogether. History still counts everything the account sent as the bot's.
+- With `receiveOwnMessages`, the owner answers a modal opened for them and runs slash commands like anyone, and quoting the account's own message is no longer a mention. The adapter's own echoes never answer a modal or run a command; one could have answered a modal with its own question.
+- `numberedActions()` skips whatever the paired account sends, so its owner never picks a contact's option.
+
+### Fixed
+
+- `manageClient: true` on a client you already started called `initialize()` again, launching a second browser on the same profile that never became ready. Its session is now adopted, as a bridged one is, and the adapter runs it from then on.
+- A signal's 8 seconds could end the process while the browser was still closing, leaving Chromium running with the profile locked. A browser still closing then is now ended outright first.
+- A process killed outright, by `kill -9`, the OOM killer or a process manager, left its browser running with the profile locked, and every start failed with "The browser is already running" until someone ended it. The next start now ends it and opens the session, but only a browser on the same host and profile whose launching process is gone, never one another process runs.
+- A catch-up that could not read its position from the Chat SDK state, or list the chats, never ran again until the session reconnected, and a position that could not be written waited for the next message. The watchdog now tries both again, and `disconnect()` writes a failed position once more. Two catch-ups no longer run at once after quick reconnects.
+- An attempt to open the session that a newer one replaced could finish late and take over the newer one's watch on its browser, so closing that browser on purpose read as a crash and opened the session again. A replaced attempt now leaves the session alone, and a bridged client connected again no longer stacks a second watch.
+
 ## 0.1.5
 
 ### Fixed

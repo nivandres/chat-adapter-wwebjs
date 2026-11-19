@@ -105,16 +105,16 @@ This is a live browser session, not a webhook: `handleWebhook` answers `501`. A 
 | `client`             | —               | An existing whatsapp-web.js `Client`, exposed as `adapter.client`. One already started is bridged; one never started is the adapter's to run. See [Bridging your own client](#bridging-your-own-client). When omitted, one is built from `clientOptions`. |
 | `clientOptions`      | `{}`            | Options for the client the adapter builds: `authStrategy`, `puppeteer`, `webVersionCache`, and so on. Ignored when `client` is set.                                                                                                                       |
 | `connectTimeoutMs`   | 2 minutes       | How long opening the session may take before it is abandoned and, with `reconnect`, tried again. Once a QR or pairing code is shown, it waits for the scan.                                                                                               |
-| `handleSignals`      | `true`          | Close the session on SIGINT, SIGTERM and SIGHUP, then let the signal end the process — unless your app listens for it and shuts down itself. Closing is given 8 seconds.                                                                                  |
+| `handleSignals`      | `true`          | Close the session on SIGINT, SIGTERM and SIGHUP, then let the signal end the process — unless your app listens for it and shuts down itself. Closing is given 8 seconds; a browser still closing then is ended outright.                                  |
 | `logger`             | `ConsoleLogger` | Logger used until `Chat` hands over its own.                                                                                                                                                                                                              |
 | `modalTexts`         | English         | The phrases a conversational modal sends, such as its _cancel_ and _skip_ words, to put them in your users' language. See [Modals](#modals).                                                                                                              |
-| `manageClient`       | by state        | Force who runs a `client` you passed: `true` has the adapter reconnect it, close it on `disconnect()` and on a signal, even if you started it; `false` only bridges it, even if you didn't.                                                               |
+| `manageClient`       | by state        | Force who runs a `client` you passed: `true` has the adapter reconnect it, close it on `disconnect()` and on a signal, adopting one you started without a second browser; `false` only bridges it, even if you didn't.                                    |
 | `markSeen`           | `false`         | Send a read receipt for every inbound message as it arrives.                                                                                                                                                                                              |
 | `maxMediaBytes`      | 64 MB           | Largest media read into memory, inbound or fetched from a `url`. The size is checked before reading and the bytes are counted as they arrive, whatever size the sender claims.                                                                            |
 | `onPairingCode`      | —               | Receives the 8-character pairing code when `phoneNumber` is set.                                                                                                                                                                                          |
 | `onQR`               | —               | Receives the QR string during login. Render it with `qrcode-terminal` or similar.                                                                                                                                                                         |
 | `phoneNumber`        | —               | Log in with a pairing code instead of a QR. E.164 without the leading `+`.                                                                                                                                                                                |
-| `receiveOwnMessages` | `false`         | Pass what the paired account did — its messages, edits, deletes and reactions — to the Chat SDK, which still skips most of its own.                                                                                                                       |
+| `receiveOwnMessages` | `false`         | Deliver what the account's owner does on the phone — messages, edits, deletes and reactions — as a person's, from `botUserId`. What the adapter sends stays its own. See [Messages from the phone](#messages-from-the-phone).                             |
 | `richContent`        | `false`         | Imitate what WhatsApp lacks: cards in its markup with their images as media, and modals as conversations. Off, a card is plain text and the adapter has no `openModal`. See [Rich content](#rich-content).                                                |
 | `recommendedArgs`    | `true`          | Start Chromium with `RECOMMENDED_CHROMIUM_ARGS`: one renderer process, no GPU, no component updates.                                                                                                                                                      |
 | `reconnect`          | `true`          | Open the session again when WhatsApp drops it, backing off from 5 seconds to 5 minutes. A logout is never retried.                                                                                                                                        |
@@ -242,7 +242,7 @@ bot.onAction("approve", async (event) => {
 });
 ```
 
-The options of a thread's latest card answer for a day (`ttlMs`) and live in the Chat SDK state. The first pick ends them, so a repeated answer runs nothing twice; a reply quoting another message is not a pick, and neither is anything the bot's own account sends. In a group anyone can answer, and `event.user` says who did. The reply that picked an option is not delivered as a message unless `keepMessage` is set.
+The options of a thread's latest card answer for a day (`ttlMs`) and live in the Chat SDK state. The first pick ends them, so a repeated answer runs nothing twice; a reply quoting another message is not a pick, and neither is anything the paired account sends, its owner's messages included. In a group anyone can answer, and `event.user` says who did. The reply that picked an option is not delivered as a message unless `keepMessage` is set.
 
 An addon is a plain object with optional `renderCard`, `cardSent` and `onMessage` hooks, so other layers fit the same way.
 
@@ -343,7 +343,7 @@ What the adapter does with it depends on whether it was started when you passed 
 - **Already started**, as above, it is bridged as it is. `connect()` adopts its session without a second `initialize()`, or waits for it if it is still starting. Its options and listeners are left alone, and its lifecycle stays yours: the adapter never reconnects or destroys it, nor closes it on a signal, and `disconnect()` only detaches the adapter.
 - **Never started**, it is the adapter's to run, exactly as one it built: `connect()` starts it, and the adapter reconnects it, closes it on `disconnect()` and on a signal.
 
-`manageClient` forces either way: `true` hands even a client you started to the adapter, and `false` keeps even an unstarted one a bridge, which `connect()` starts but never reconnects or closes.
+`manageClient` forces either way: `true` hands even a client you started to the adapter, which adopts its session without a second `initialize()` and runs it from then on, and `false` keeps even an unstarted one a bridge, which `connect()` starts but never reconnects or closes.
 
 ## Message history
 
@@ -353,7 +353,24 @@ What the adapter does with it depends on whether it was started when you passed 
 
 ## Catching up after downtime
 
-WhatsApp Web loads what arrived while the session was down without firing an event for each message, so the adapter catches up on its own once the session is back: it gathers what every recent chat missed, oldest first, and hands each message to your handlers. The position lives in the Chat SDK state with the account it belongs to, so a restart starts where the last process stopped, and pairing a new number starts afresh. A restart part-way through delivers again rather than skip, and a message that arrives live while it is caught up is handled once. The first run starts counting and replays nothing older. A chat outside the 100 most recent, or more than 50 messages behind, is not caught up in full, and the adapter logs a warning when that happens.
+WhatsApp Web loads what arrived while the session was down without firing an event for each message, so the adapter catches up on its own once the session is back: it gathers what every recent chat missed, oldest first, and hands each message to your handlers. The position lives in the Chat SDK state with the account it belongs to, so a restart starts where the last process stopped, and pairing a new number starts afresh. A restart part-way through delivers again rather than skip, and a message that arrives live while it is caught up is handled once. The first run starts counting and replays nothing older. A chat outside the 100 most recent, or more than 50 messages behind, is not caught up in full, and the adapter logs a warning when that happens. A catch-up that could not read its position or list the chats, and a position that could not be recorded, are tried again on the watchdog's next check.
+
+## Messages from the phone
+
+The paired account is someone's WhatsApp, and they may keep using it. By default nothing the account sends reaches your handlers. With `receiveOwnMessages`, what its owner does on the phone or another linked device — messages, edits, deletes and reactions — arrives as a person's, from the bot's own account:
+
+```typescript
+const whatsapp = createWWebJSAdapter({ receiveOwnMessages: true });
+
+bot.onSubscribedMessage(async (thread, message) => {
+  if (message.author.userId === whatsapp.botUserId) return thread.unsubscribe(); // the owner took over
+  await thread.post(`You said: ${message.text}`);
+});
+```
+
+What the adapter itself sends stays its own, `isMe`, which the Chat SDK skips. It knows each message it sent, even one WhatsApp echoes back before the send returns, and records it in the Chat SDK state for as long as `catchUpMs` reaches back, so a restart that catches up on the account's messages still skips its own. Catching up from a position recorded without that record, before 0.2.0 or with the option off, skips the account's messages altogether. An edit is its own when it edits a message the adapter sent, a reaction when the adapter reacted to that message, and a forward when its echo answers one the adapter made. Deletes carry no author, so the adapter's come through too.
+
+The owner answers a modal opened for them and runs your slash commands like anyone, while the adapter's own echoes never do. Nothing the account sends picks a card's numbered option, and the owner quoting the account's own message is no mention. History — `fetchMessages` and the like — still counts everything the account sent as the bot's own, since what the adapter sent is remembered only that long.
 
 ## Multiple accounts
 
@@ -406,7 +423,8 @@ Examples: `wwebjs:15551234567@c.us` (DM by phone), `wwebjs:99990000111122@lid` (
 ### "The browser is already running"
 
 - Another process holds the same `LocalAuth` profile. The adapter ends every browser it launches before reopening, even one whatsapp-web.js never handed over; a client you started yourself is yours to close.
-- A process killed outright, by `kill -9` or the OOM killer, leaves its browser running. End it before starting again: on Linux and macOS the profile's `SingletonLock` points at `<host>-<pid>`.
+- A process killed outright, by `kill -9`, the OOM killer or a process manager out of patience, leaves its browser running. The next start ends it when it runs on the same host, on the same profile, with the process that launched it gone, found through `ps`, which slim images may lack.
+- A lock left on the profile by another host, as by a container recreated with a new hostname, is never cleared, since that browser may still run there. Give the container a fixed `hostname`, or remove the profile's `SingletonLock` once you are sure.
 
 ### The session drops
 
@@ -417,7 +435,7 @@ Examples: `wwebjs:15551234567@c.us` (DM by phone), `wwebjs:99990000111122@lid` (
 - **Unofficial.** It automates WhatsApp Web, which WhatsApp may block or change at any time.
 - **One session per number**, as WhatsApp Web itself allows.
 - **No scheduling or ephemeral messages.** `postEphemeral` falls back to a DM; `thread.schedule()` throws.
-- **Everything the paired account sends counts as the bot's own**, from the phone too, so the Chat SDK skips its messages, edits and reactions even with `receiveOwnMessages`; only its deletes come through.
+- **History counts everything the paired account sent as the bot's own.** Only what arrives, live or caught up, tells its owner's messages from the adapter's; see [Messages from the phone](#messages-from-the-phone).
 - **An attachment given only by `url` is fetched over HTTPS**, never from a private or internal address, with a 30-second timeout and `maxMediaBytes` as its limit.
 - **A bare `@number` in outgoing text stays text.** Mention someone with `thread.mentionUser(id)`.
 - **`forwardMessage` and event call links fail on current WhatsApp Web.** whatsapp-web.js still calls modules WhatsApp has renamed; both return once it catches up. `sendEvent` without `callType` attaches no link and works.

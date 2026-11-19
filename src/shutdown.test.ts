@@ -20,8 +20,8 @@ describe("closeOnSignal", () => {
   it("closes every session before the signal ends the process", async () => {
     const { closeOnSignal } = await import("./shutdown");
     const closed: string[] = [];
-    closeOnSignal(async () => void closed.push("one"));
-    closeOnSignal(async () => void closed.push("two"));
+    closeOnSignal(async () => void closed.push("one"), vi.fn());
+    closeOnSignal(async () => void closed.push("two"), vi.fn());
     expect(process.listenerCount("SIGTERM")).toBe(1);
 
     process.emit("SIGTERM", "SIGTERM");
@@ -35,7 +35,7 @@ describe("closeOnSignal", () => {
     const { closeOnSignal } = await import("./shutdown");
     const close = vi.fn(async () => undefined);
     const own = vi.fn();
-    closeOnSignal(close);
+    closeOnSignal(close, vi.fn());
     process.on("SIGTERM", own);
 
     process.emit("SIGTERM", "SIGTERM");
@@ -50,7 +50,7 @@ describe("closeOnSignal", () => {
     const { closeOnSignal } = await import("./shutdown");
     closeOnSignal(async () => {
       throw new Error("browser stuck");
-    });
+    }, vi.fn());
 
     process.emit("SIGTERM", "SIGTERM");
 
@@ -61,7 +61,7 @@ describe("closeOnSignal", () => {
     vi.useFakeTimers();
     try {
       const { closeOnSignal } = await import("./shutdown");
-      closeOnSignal(() => new Promise(() => {}));
+      closeOnSignal(() => new Promise(() => {}), vi.fn());
 
       process.emit("SIGTERM", "SIGTERM");
       await vi.advanceTimersByTimeAsync(8_000);
@@ -72,10 +72,29 @@ describe("closeOnSignal", () => {
     }
   });
 
+  it("ends what is still closing once the grace period is over, before the signal ends the process", async () => {
+    vi.useFakeTimers();
+    try {
+      const { closeOnSignal } = await import("./shutdown");
+      const stuck = vi.fn();
+      closeOnSignal(() => new Promise(() => {}), stuck);
+
+      process.emit("SIGTERM", "SIGTERM");
+      await vi.advanceTimersByTimeAsync(7_999);
+      expect(stuck).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(stuck).toHaveBeenCalledOnce();
+      expect(stuck.mock.invocationCallOrder[0]).toBeLessThan(kill.mock.invocationCallOrder[0]!);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("stops listening once the last session is gone", async () => {
     const { closeOnSignal } = await import("./shutdown");
-    const first = closeOnSignal(async () => undefined);
-    const second = closeOnSignal(async () => undefined);
+    const first = closeOnSignal(async () => undefined, vi.fn());
+    const second = closeOnSignal(async () => undefined, vi.fn());
 
     first();
     expect(process.listenerCount("SIGTERM")).toBe(1);

@@ -74,8 +74,9 @@ export interface WWebJSAdapterConfig {
   /**
    * Close the session on SIGINT, SIGTERM and SIGHUP, then let the signal end
    * the process as it otherwise would — unless the app listens for it, and
-   * shuts down itself. Puppeteer alone closes the browser and leaves the
-   * process running. Defaults to `true`.
+   * shuts down itself. A browser still closing after 8 seconds is ended
+   * outright first, so it never outlives the process. Puppeteer alone closes
+   * the browser and leaves the process running. Defaults to `true`.
    */
   handleSignals?: boolean;
 
@@ -85,8 +86,8 @@ export interface WWebJSAdapterConfig {
   /**
    * Force who runs a `client` you passed, whatever its state: `true` has the
    * adapter reconnect it, destroy it on `disconnect()` and close it on a
-   * signal; `false` only bridges it. Decided by whether it was started when
-   * omitted.
+   * signal, adopting one already started rather than starting it twice;
+   * `false` only bridges it. Decided by whether it was started when omitted.
    */
   manageClient?: boolean;
 
@@ -124,9 +125,13 @@ export interface WWebJSAdapterConfig {
   maxMediaBytes?: number;
 
   /**
-   * Deliver messages the paired account sent — from the phone or from this
-   * adapter — to the Chat SDK, along with its own edits, deletes and
-   * reactions. Defaults to `false`.
+   * Deliver what the paired account's owner does from the phone or another
+   * linked device — messages, edits, deletes and reactions — as a person's,
+   * from `botUserId`, so `message.author.userId === adapter.botUserId` tells
+   * them apart. What this adapter sends, edits or reacts with stays its own,
+   * `isMe`, which the Chat SDK skips, after a restart too for as long as
+   * `catchUpMs` reaches back. Deletes carry no author, so the adapter's come
+   * through too. Defaults to `false`.
    */
   receiveOwnMessages?: boolean;
 

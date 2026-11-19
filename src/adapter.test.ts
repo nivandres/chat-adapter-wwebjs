@@ -29,6 +29,7 @@ import { createWWebJSAdapter, RECOMMENDED_CHROMIUM_ARGS, WWebJSAdapter } from ".
 import { isWWebJSAdapter, requireWWebJSAdapter } from "./guards";
 import { triggerIdOf } from "./modals";
 import { numberedActions } from "./numbered-actions";
+import { freeProfile } from "./profile";
 import { closeOnSignal } from "./shutdown";
 
 vi.mock("@chat-adapter/shared", async (original) => {
@@ -38,6 +39,7 @@ vi.mock("@chat-adapter/shared", async (original) => {
 
 const unsignal = vi.fn();
 vi.mock("./shutdown", () => ({ closeOnSignal: vi.fn(() => unsignal) }));
+vi.mock("./profile", () => ({ freeProfile: vi.fn(async () => false) }));
 beforeEach(() => vi.clearAllMocks());
 
 const BOT = "15550000000@c.us";
@@ -110,7 +112,7 @@ function fakeClient(overrides: Record<string, unknown> = {}) {
     getState: vi.fn(async () => "CONNECTED"),
     info: { pushname: "Bot", wid: { _serialized: BOT } },
     initialize: vi.fn(async () => undefined),
-    options: { puppeteer: {} as { signal?: AbortSignal } },
+    options: { puppeteer: {} as { signal?: AbortSignal; userDataDir?: string } },
     searchMessages: vi.fn(async () => []),
     sendMessage: vi.fn(async (chatId: string, _content?: unknown, _options?: MessageSendOptions) =>
       waMessage({ fromMe: true, messageId: "SENT", remote: chatId }),
@@ -1307,6 +1309,236 @@ describe("WWebJSAdapter", () => {
     });
   });
 
+  describe("what the paired account does, with receiveOwnMessages", () => {
+    const authorOf = async (chat: ReturnType<typeof fakeChatInstance>, call = 0) =>
+      (await (chat.processMessage.mock.calls[call]![2] as () => Promise<Message>)()).author;
+
+    /** whatsapp-web.js can emit a send's echo before sendMessage() returns its id. */
+    function echoFirst(client: ReturnType<typeof fakeClient>) {
+      let count = 0;
+      client.sendMessage.mockImplementation(async (chatId: string, content?: unknown) => {
+        const body = typeof content === "string" ? content : "";
+        const sent = waMessage({ body, fromMe: true, messageId: `S${++count}`, remote: chatId });
+        client.emit("message_create", sent);
+        await flush();
+        return sent;
+      });
+    }
+
+    it("delivers what the operator types on the phone as a person's, from the bot's account", async () => {
+      const { chat, client } = await connected({ receiveOwnMessages: true });
+      client.emit("message_create", waMessage({ body: "on it", fromMe: true }));
+
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledOnce());
+      expect(await authorOf(chat)).toMatchObject({ isBot: false, isMe: false, userId: BOT });
+    });
+
+    it("keeps whatever it sends its own, even when the echo comes before the send returns", async () => {
+      const { adapter, chat, client } = await connected({ receiveOwnMessages: true });
+      echoFirst(client);
+      await adapter.postMessage(THREAD, {
+        files: [{ data: Buffer.from("x"), filename: "note.ogg" }],
+        raw: "listen",
+      });
+      await adapter.reply(THREAD, "Q", "sure");
+      await adapter.sendPoll({ options: ["Yes", "No"], question: "Lunch?", threadId: THREAD });
+      await adapter.sendLocation({ latitude: 4.6, longitude: -74, threadId: THREAD });
+      await adapter.sendEvent({ name: "Standup", startTime: new Date(), threadId: THREAD });
+
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledTimes(6));
+      for (let call = 0; call < 6; call++) {
+        expect(await authorOf(chat, call)).toMatchObject({ isBot: true, isMe: true, userId: BOT });
+      }
+    });
+
+    it("remembers what it sent across a restart, so catching up never hands it its own", async () => {
+      const state = createMemoryState();
+      await state.connect();
+      const now = Math.floor(Date.now() / 1000);
+      const before = createWWebJSAdapter({
+        client: fakeClient() as never,
+        receiveOwnMessages: true,
+      });
+      await before.initialize(fakeChatInstance(state) as unknown as ChatInstance);
+      await before.postMessage(THREAD, "sent before the restart");
+      await state.set("wwebjs:wwebjs:seen", { at: now - 60, ids: [], own: true, wid: BOT });
+
+      const chat = fakeChatInstance(state);
+      const fetchMessages = vi.fn(async () => [
+        waMessage({ fromMe: true, messageId: "SENT", timestamp: now - 30 }),
+        waMessage({ fromMe: true, messageId: "PHONE", timestamp: now - 20 }),
+      ]);
+      const client = fakeClient({
+        getChats: vi.fn(async () => [waChat({ fetchMessages, timestamp: now })]),
+      });
+      const adapter = createWWebJSAdapter({ client: client as never, receiveOwnMessages: true });
+      await adapter.initialize(chat as unknown as ChatInstance);
+      client.emit("ready");
+
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledTimes(2));
+      expect(await authorOf(chat, 0)).toMatchObject({ isMe: true });
+      expect(await authorOf(chat, 1)).toMatchObject({ isMe: false, userId: BOT });
+    });
+
+    it("catches up on none of the account's own messages from a position recorded without them", async () => {
+      const state = createMemoryState();
+      await state.connect();
+      const now = Math.floor(Date.now() / 1000);
+      await state.set("wwebjs:wwebjs:seen", { at: now - 60, ids: [], wid: BOT });
+      const chat = fakeChatInstance(state);
+      const fetchMessages = vi.fn(async () => [
+        waMessage({
+          body: "sent while it was off",
+          fromMe: true,
+          messageId: "OLD",
+          timestamp: now - 30,
+        }),
+        waMessage({ body: "missed", messageId: "M", timestamp: now - 20 }),
+      ]);
+      const client = fakeClient({
+        getChats: vi.fn(async () => [waChat({ fetchMessages, timestamp: now })]),
+      });
+      const adapter = createWWebJSAdapter({ client: client as never, receiveOwnMessages: true });
+      await adapter.initialize(chat as unknown as ChatInstance);
+      client.emit("ready");
+
+      await vi.waitFor(async () =>
+        expect(await state.get("wwebjs:wwebjs:seen")).toMatchObject({ at: now - 20, own: true }),
+      );
+      expect(chat.processMessage).toHaveBeenCalledOnce();
+      expect(await authorOf(chat)).toMatchObject({ isMe: false, userId: ALICE });
+    });
+
+    it("tells its own edits and reactions from the operator's", async () => {
+      const react = vi.fn(async () => undefined);
+      const { adapter, chat, client } = await connected(
+        { receiveOwnMessages: true },
+        { getMessageById: vi.fn(async () => waMessage({ messageId: "THEIRS", react })) },
+      );
+      await adapter.postMessage(THREAD, "draft");
+      await adapter.addReaction(THREAD, "THEIRS", "👍");
+      client.emit("message_edit", waMessage({ fromMe: true, messageId: "SENT" }), "final", "draft");
+      client.emit("message_edit", waMessage({ fromMe: true, messageId: "PHONE" }), "fixed", "typo");
+      for (const target of ["THEIRS", "OTHER"]) {
+        client.emit("message_reaction", {
+          id: { fromMe: true, remote: ALICE },
+          msgId: { _serialized: `false_${ALICE}_${target}` },
+          reaction: "👍",
+          senderId: BOT,
+        });
+      }
+
+      await vi.waitFor(() => expect(chat.processMessageUpdated).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(chat.processReaction).toHaveBeenCalledTimes(2));
+      const edits = await Promise.all(
+        chat.processMessageUpdated.mock.calls.map(async ([event]) => {
+          const message = await event.message();
+          return [message.id, message.author.isMe, (await event.previousMessage()).author.isMe];
+        }),
+      );
+      expect(edits).toEqual(
+        expect.arrayContaining([
+          [`true_${ALICE}_SENT`, true, true],
+          [`true_${ALICE}_PHONE`, false, false],
+        ]),
+      );
+      const reactions = chat.processReaction.mock.calls.map(([event]) => [
+        event.messageId,
+        event.user.isMe,
+      ]);
+      expect(reactions).toEqual(
+        expect.arrayContaining([
+          [`false_${ALICE}_THEIRS`, true],
+          [`false_${ALICE}_OTHER`, false],
+        ]),
+      );
+    });
+
+    it("claims the echo of a forward it makes, which WhatsApp returns no id for", async () => {
+      const forward = vi.fn(async () => undefined);
+      const { adapter, chat, client } = await connected(
+        { receiveOwnMessages: true },
+        { getMessageById: vi.fn(async () => waMessage({ forward })) },
+      );
+      await adapter.forwardMessage("ID", GROUP_THREAD);
+      for (const messageId of ["FORWARDED", "PHONE"]) {
+        client.emit(
+          "message_create",
+          waMessage({ fromMe: true, isForwarded: true, messageId, remote: GROUP }),
+        );
+      }
+
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledTimes(2));
+      expect(await authorOf(chat, 0)).toMatchObject({ isMe: true });
+      expect(await authorOf(chat, 1)).toMatchObject({ isMe: false });
+    });
+
+    it("lets the operator answer a modal and run commands, which its own echoes never do", async () => {
+      const { adapter, chat, client } = await connected({
+        receiveOwnMessages: true,
+        richContent: true,
+        slashCommands: ["/pause"],
+      });
+      echoFirst(client);
+      await adapter.openModal!(
+        triggerIdOf(THREAD, BOT),
+        Modal({
+          callbackId: "note",
+          children: [TextInput({ id: "text", label: "Note" })],
+          title: "Note",
+        }),
+      );
+      await adapter.postMessage(THREAD, "/pause");
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledTimes(2));
+      expect(chat.processModalSubmit).not.toHaveBeenCalled();
+      expect(chat.processSlashCommand).not.toHaveBeenCalled();
+
+      client.emit(
+        "message_create",
+        waMessage({ body: "call at 5", fromMe: true, messageId: "P1" }),
+      );
+      await vi.waitFor(() =>
+        expect(chat.processModalSubmit).toHaveBeenCalledWith(
+          expect.objectContaining({
+            user: expect.objectContaining({ isMe: false }),
+            values: { text: "call at 5" },
+          }),
+          undefined,
+        ),
+      );
+
+      client.emit("message_create", waMessage({ body: "/pause", fromMe: true, messageId: "P2" }));
+      await vi.waitFor(() =>
+        expect(chat.processSlashCommand).toHaveBeenCalledWith(
+          expect.objectContaining({
+            command: "/pause",
+            user: expect.objectContaining({ isMe: false, userId: BOT }),
+          }),
+          undefined,
+        ),
+      );
+    });
+
+    it("never takes the operator quoting the account's own message for a mention", async () => {
+      const { chat, client } = await connected({ receiveOwnMessages: true });
+      client.emit(
+        "message_create",
+        waMessage({
+          body: "as I said",
+          fromMe: true,
+          getQuotedMessage: vi.fn(async () => waMessage({ fromMe: true, messageId: "EARLIER" })),
+          hasQuotedMsg: true,
+          remote: GROUP,
+        }),
+      );
+
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledOnce());
+      const message = await chat.processMessage.mock.calls[0]![2]();
+      expect(message.replyTo.id).toBe(`true_${ALICE}_EARLIER`);
+      expect(message.isMention).toBeUndefined();
+    });
+  });
+
   describe("polls", () => {
     const vote = {
       parentMessage: waMessage({
@@ -1559,6 +1791,37 @@ describe("WWebJSAdapter", () => {
       expect(client.listenerCount("auth_failure")).toBe(0);
     });
 
+    it("ends a browser a process killed outright left holding the profile, then starts", async () => {
+      vi.mocked(freeProfile).mockResolvedValueOnce(true);
+      const { adapter, client } = await connected();
+      client.initialize.mockImplementationOnce(async () => {
+        client.options.puppeteer = { ...client.options.puppeteer, userDataDir: "/srv/session" };
+        throw new Error("The browser is already running for /srv/session.");
+      });
+
+      const attempt = adapter.connect();
+      await vi.waitFor(() => expect(client.initialize).toHaveBeenCalledTimes(2));
+      client.emit("ready");
+      await attempt;
+
+      expect(freeProfile).toHaveBeenCalledWith("/srv/session");
+      expect(adapter.connection).toBe("connected");
+    });
+
+    it("fails as before when the profile is held by a browser it may not end", async () => {
+      const { adapter, client } = await connected({ reconnect: false });
+      client.initialize.mockRejectedValueOnce(new Error("The browser is already running."));
+
+      await expect(adapter.connect()).rejects.toThrow("already running");
+      expect(client.initialize).toHaveBeenCalledOnce();
+
+      vi.mocked(freeProfile).mockClear();
+      const bridged = await connected({ manageClient: false, reconnect: false });
+      bridged.client.initialize.mockRejectedValueOnce(new Error("The browser is already running."));
+      await expect(bridged.adapter.connect()).rejects.toThrow("already running");
+      expect(freeProfile).not.toHaveBeenCalled();
+    });
+
     it("logs a QR handler that fails rather than ending the process", async () => {
       const unhandled = vi.fn();
       process.on("unhandledRejection", unhandled);
@@ -1611,18 +1874,32 @@ describe("WWebJSAdapter", () => {
         expect(adapter.connection).toBe("connected");
       });
 
-      it("runs a started client when forced to, and only bridges an unstarted one when told", async () => {
-        const forced = await connected({ manageClient: true }, running());
-        const attempt = forced.adapter.connect();
-        await vi.waitFor(() => expect(forced.client.initialize).toHaveBeenCalledOnce());
-        forced.client.emit("ready");
-        await attempt;
-        await forced.adapter.disconnect();
-        expect(forced.client.destroy).toHaveBeenCalled();
+      it("adopts a started client it is told to run, without a second browser, and runs it from then on", async () => {
+        const { adapter, client } = await connected({ manageClient: true }, running());
+        await adapter.connect();
+        expect(client.initialize).not.toHaveBeenCalled();
+        expect(adapter.connection).toBe("connected");
+        expect(closeOnSignal).toHaveBeenCalledOnce();
 
-        const bridged = await connected({ manageClient: false });
-        await bridged.adapter.disconnect();
-        expect(bridged.client.destroy).not.toHaveBeenCalled();
+        client.emit("disconnected", "CONFLICT");
+        const reopened = adapter.connect();
+        await vi.waitFor(() => expect(client.initialize).toHaveBeenCalledOnce());
+        expect(client.destroy).toHaveBeenCalledOnce();
+        client.emit("ready");
+        await reopened;
+        await adapter.disconnect();
+      });
+
+      it("waits for a started client it is told to run while it is still starting", async () => {
+        const { adapter, client } = await connected({ manageClient: true }, running("OPENING"));
+        const attempt = adapter.connect();
+        await flush();
+        client.emit("ready");
+        await attempt;
+
+        expect(client.initialize).not.toHaveBeenCalled();
+        await adapter.disconnect();
+        expect(client.destroy).toHaveBeenCalled();
       });
 
       it("keeps no hold on the browser of a client it only bridges, even one it started", async () => {
@@ -1839,6 +2116,27 @@ describe("WWebJSAdapter", () => {
           expect(kill).not.toHaveBeenCalled();
           kill.mockRestore();
         });
+      });
+
+      it("keeps the newer attempt's watch on the browser when a superseded one finishes late", async () => {
+        const browser = Object.assign(new EventEmitter(), { isConnected: () => false });
+        const { adapter, client } = await connected({}, { pupBrowser: browser });
+        let finishFirst!: (value: undefined) => void;
+        client.initialize.mockImplementationOnce(
+          () => new Promise((resolve) => (finishFirst = resolve)),
+        );
+        void adapter.connect().catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(0);
+
+        client.emit("disconnected", "CONFLICT");
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(client.initialize).toHaveBeenCalledTimes(2);
+        finishFirst(undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(browser.listenerCount("disconnected")).toBe(1);
+
+        await adapter.disconnect();
+        expect(browser.listenerCount("disconnected")).toBe(0);
       });
 
       it("does not let a pending retry tear down a session opened in the meantime", async () => {
@@ -2123,6 +2421,54 @@ describe("WWebJSAdapter", () => {
       );
     });
 
+    async function watched(state: StateAdapter, messages: unknown[] = []) {
+      const chat = fakeChatInstance(state);
+      const fetchMessages = vi.fn(async () => messages);
+      const client = fakeClient({
+        getChats: vi.fn(async () => [
+          waChat({ fetchMessages, timestamp: Math.floor(Date.now() / 1000) }),
+        ]),
+      });
+      const adapter = createWWebJSAdapter({
+        catchUpMs: Number.MAX_SAFE_INTEGER,
+        client: client as never,
+        watchdogIntervalMs: 20,
+      });
+      await adapter.initialize(chat as unknown as ChatInstance);
+      const attempt = adapter.connect();
+      client.emit("ready");
+      await attempt;
+      return { adapter, chat, client };
+    }
+
+    it("catches up on the watchdog's next check when its position could not be read", async () => {
+      const state = createMemoryState();
+      await state.connect();
+      await state.set(seenKey, { at: T, ids: [] });
+      vi.spyOn(state, "get").mockRejectedValueOnce(new Error("state down"));
+      const { adapter, chat } = await watched(state, [
+        waMessage({ body: "missed", messageId: "M", timestamp: T + 1 }),
+      ]);
+
+      await vi.waitFor(() => expect(chat.processMessage).toHaveBeenCalledOnce());
+      await vi.waitFor(async () => expect(await state.get(seenKey)).toMatchObject({ at: T + 1 }));
+      await adapter.disconnect();
+    });
+
+    it("records its position again on the watchdog's next check when writing it failed", async () => {
+      const state = createMemoryState();
+      await state.connect();
+      await state.set(seenKey, { at: T, ids: [] });
+      vi.spyOn(state, "set").mockRejectedValueOnce(new Error("state down"));
+      const { adapter, client } = await watched(state);
+      client.emit("message_create", waMessage({ body: "new", messageId: "N", timestamp: T + 99 }));
+
+      await vi.waitFor(async () =>
+        expect(await state.get(seenKey)).toMatchObject({ at: T + 99, ids: [`false_${ALICE}_N`] }),
+      );
+      await adapter.disconnect();
+    });
+
     it("skips what is older than catchUpMs, and everything when it is off", async () => {
       const now = Math.floor(Date.now() / 1000);
       const old = await readyWith(
@@ -2157,6 +2503,35 @@ describe("WWebJSAdapter", () => {
       void adapter.connect();
       await adapter.disconnect();
       expect(unsignal).toHaveBeenCalled();
+    });
+
+    it("hands a signal a way to end its browser at once, should closing outlast the grace period", async () => {
+      const child = Object.assign(new EventEmitter(), {
+        exitCode: null,
+        kill: vi.fn(),
+        pid: 4242,
+        signalCode: null,
+      });
+      const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+      const { adapter, client } = await connected(
+        {},
+        {
+          pupBrowser: Object.assign(new EventEmitter(), {
+            isConnected: () => false,
+            process: () => child,
+          }),
+        },
+      );
+      const attempt = adapter.connect();
+      client.emit("ready");
+      await attempt;
+      const launch = client.options.puppeteer.signal;
+
+      vi.mocked(closeOnSignal).mock.calls[0]![1]();
+
+      expect(launch?.aborted).toBe(true);
+      expect(kill).toHaveBeenCalledWith(-4242, "SIGKILL");
+      kill.mockRestore();
     });
 
     it("leaves signals alone when told not to", async () => {
@@ -2267,7 +2642,7 @@ describe("WWebJSAdapter", () => {
       expect(chat.processAction).toHaveBeenCalledOnce();
     });
 
-    it("ignores the bot's own messages and a reply quoting another message", async () => {
+    it("ignores anything the paired account sends and a reply quoting another message", async () => {
       const { chat, client } = await withAddon({ keepMessage: false });
       client.emit(
         "message_create",
@@ -2286,6 +2661,7 @@ describe("WWebJSAdapter", () => {
       own.client.emit("message_create", waMessage({ body: "1", fromMe: true, messageId: "R2" }));
       await vi.waitFor(() => expect(own.chat.processMessage).toHaveBeenCalledOnce());
       expect(own.chat.processAction).not.toHaveBeenCalled();
+      expect(own.chat.processMessage.mock.calls[0]![2].author).toMatchObject({ isMe: false });
     });
 
     it("delivers anything else as a message, and the pick too when asked", async () => {

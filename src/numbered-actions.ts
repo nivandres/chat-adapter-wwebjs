@@ -79,7 +79,8 @@ export function numberedActions(options: NumberedActionsOptions = {}): WWebJSAdd
         .set<Offer>(keyOf(context), { choices, messageId }, options.ttlMs ?? TTL_MS);
     },
     async onMessage(message, context) {
-      if (message.author.isMe || !context.chat) return false;
+      // Whatever the paired account sends, the operator included, never picks a contact's option.
+      if (message.raw.fromMe || !context.chat) return false;
       const state = context.chat.getState();
       const offer = await state.get<Offer>(keyOf(context));
       // A reply quoting another message answers that one, not the latest card.

@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { once } from "node:events";
 import { extractCard, ResourceNotFoundError, ValidationError } from "@chat-adapter/shared";
 import {
   ConsoleLogger,
@@ -79,6 +78,7 @@ import {
   triggerIdOf,
   type Form,
 } from "./modals.js";
+import { freeProfile } from "./profile.js";
 import { closeOnSignal } from "./shutdown.js";
 import type {
   WWebJSAck,
@@ -160,7 +160,7 @@ const CATCH_UP_MS = 86_400_000;
 /** A session down for long must not flood the bot with every chat it has. */
 const MAX_CATCH_UP_CHATS = 100;
 const MAX_CATCH_UP_MESSAGES = 50;
-/** Inbound ids remembered, so a message delivered live and caught up again is handled once. */
+/** Ids kept in memory: inbound ones, so a message delivered live and caught up again is handled once, and what the adapter did as the account. */
 const MAX_RECENT = 1000;
 /** A timestamp is set by the sender's device, so one from the future cannot move the position past what is still to come. */
 const CLOCK_SKEW_S = 60;
@@ -181,6 +181,8 @@ interface PollVoteSubscription {
 interface Seen {
   at: number;
   ids: string[];
+  /** Recorded with `receiveOwnMessages`, so what the adapter sent since is known; absent, the account's own messages are not caught up. */
+  own?: boolean;
   /** The account it was recorded for; absent before 0.1.3. */
   wid?: string;
 }
@@ -232,6 +234,14 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   private _behind?: WAMessage[];
   private readonly _recent = new Set<string>();
   private _saving: Promise<unknown> = Promise.resolve();
+  private _unsaved = false;
+  /** Catch-ups run in turn, so two never hold or move the position at once. */
+  private _catching: Promise<unknown> = Promise.resolve();
+  private _owed = false;
+  /** What this adapter sent or reacted to, so the account's echo of it is told apart from what its owner does. */
+  private readonly _own = new Set<string>();
+  private readonly _sending = new Set<Promise<unknown>>();
+  private _forwards = 0;
 
   constructor(config: WWebJSAdapterConfig = {}) {
     const name = config.adapterName ?? "wwebjs";
@@ -289,7 +299,10 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     if (this._listeners.length === 0) this._listen();
     this._watch();
     if (this._owned && this._config.handleSignals !== false) {
-      this._unsignal ??= closeOnSignal(() => this.disconnect());
+      this._unsignal ??= closeOnSignal(
+        () => this.disconnect(),
+        () => void this._killBrowser(),
+      );
     }
     if (this._connection) return this._connection;
     // A newer attempt owns the connection; a superseded one must not reset it.
@@ -314,7 +327,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     this._connection = null;
     this._unsignal?.();
     this._unsignal = undefined;
-    await this._saving;
+    await (this._unsaved ? this._save() : this._saving);
     if (!this._owned) return this._unlisten();
     await this._close();
   }
@@ -468,9 +481,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     messageId: string,
     emoji: EmojiValue | string,
   ): Promise<void> {
-    await (
-      await this._requireMessage(messageId, threadId)
-    ).react(defaultEmojiResolver.toGChat(emoji));
+    await this._react(threadId, messageId, defaultEmojiResolver.toGChat(emoji));
   }
 
   async removeReaction(
@@ -478,7 +489,14 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     messageId: string,
     _emoji: EmojiValue | string,
   ): Promise<void> {
-    await (await this._requireMessage(messageId, threadId)).react("");
+    await this._react(threadId, messageId, "");
+  }
+
+  /** Marked before it is sent, since its echo can arrive before `react()` returns. */
+  private async _react(threadId: string, messageId: string, reaction: string): Promise<void> {
+    const target = await this._requireMessage(messageId, threadId);
+    await this._mark(`reacted:${serialize(target.id)}`);
+    await target.react(reaction);
   }
 
   async fetchMessages(threadId: string, options?: FetchOptions): Promise<FetchResult<WAMessage>> {
@@ -669,7 +687,14 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
   /** Forward an existing message into another thread. */
   async forwardMessage(messageId: string, targetThreadId: string): Promise<void> {
     const { chatId } = this.decodeThreadId(targetThreadId);
-    await (await this._requireMessage(messageId)).forward(chatId);
+    const message = await this._requireMessage(messageId);
+    // WhatsApp Web returns no id for a forward, so each one claims the next forwarded echo instead.
+    const claims = this._config.receiveOwnMessages ? 1 : 0;
+    this._forwards += claims;
+    await message.forward(chatId).catch((error: unknown) => {
+      this._forwards -= claims;
+      throw error;
+    });
   }
 
   /** Pin a message for the given number of seconds. */
@@ -852,7 +877,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     this.client.once("qr", waiting);
     this.client.once("code", waiting);
     try {
-      await Promise.race([this._open(), timedOut]);
+      await Promise.race([this._open(attempt), timedOut]);
     } catch (error) {
       // An abandoned attempt keeps its browser otherwise; a superseded one leaves the newer attempt's alone.
       if (this._owned && attempt === this._attempts) await this._close().catch(() => undefined);
@@ -864,12 +889,20 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     }
   }
 
-  private async _open(): Promise<void> {
+  private async _open(attempt: number): Promise<void> {
     this._state = this._initialized ? "reconnecting" : "connecting";
-    if (!this._owned && (await this._running())) {
+    // A client started elsewhere is adopted, never started twice, even when the adapter runs it from then on.
+    const adopted = this._owned
+      ? !this._initialized && !!this.client.pupBrowser?.isConnected()
+      : !!this.client.pupBrowser;
+    if (adopted && (await this._running())) {
+      // A superseded attempt leaves the newer one's session alone.
+      if (attempt !== this._attempts) return;
+      this._initialized = true;
       this._watchBrowser();
       return this._onReady();
     }
+    const options = (this.client as unknown as { options: ClientOptions }).options;
     let onReady!: () => void;
     let onFailure!: (message: string) => void;
     const ready = new Promise<void>((resolve, reject) => {
@@ -885,18 +918,23 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       // A previous session's browser is closed first, or every reconnect would leave one running.
       if (this._owned && this._initialized) await this._close().catch(() => undefined);
       this._initialized = true;
-      if (this._owned) {
-        // whatsapp-web.js hands its browser over only once the page is set up, if ever; Puppeteer ends it on this signal from launch on.
-        this._launch = new AbortController();
-        const options = (this.client as unknown as { options: ClientOptions }).options;
-        options.puppeteer = { ...options.puppeteer, signal: this._launch.signal };
+      if (!adopted) {
+        if (this._owned) {
+          // whatsapp-web.js hands its browser over only once the page is set up, if ever; Puppeteer ends it on this signal from launch on.
+          this._launch = new AbortController();
+          options.puppeteer = { ...options.puppeteer, signal: this._launch.signal };
+        }
+        await this.client.initialize().catch(async (error: unknown) => {
+          // A browser a process killed outright left running holds the profile until it is ended.
+          if (!this._owned || !(await freeProfile(options.puppeteer?.userDataDir))) throw error;
+          await this.client.initialize();
+        });
       }
-      // A client someone else already started is waited on, never started twice.
-      if (this._owned || !this.client.pupBrowser) await this.client.initialize();
       if (this._closed) {
         if (this._owned) await this._close();
         return;
       }
+      if (attempt !== this._attempts) return;
       this._watchBrowser();
       await ready;
     } finally {
@@ -907,6 +945,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
   /** A crashed browser ends the session without WhatsApp ever reporting a disconnect. */
   private _watchBrowser(): void {
+    this._unwatch?.();
     const browser = this.client.pupBrowser;
     if (!browser) return;
     const onClose = () => this._onDisconnected("BROWSER_CLOSED");
@@ -931,22 +970,28 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     }
   }
 
-  /** `destroy()` closes only a browser it still sees connected, so one that dropped keeps its profile locked. */
-  private async _killBrowser(): Promise<void> {
+  /**
+   * `destroy()` closes only a browser it still sees connected, so one that
+   * dropped keeps its profile locked. It is ended at once, as a signal whose
+   * time runs out needs, and the promise waits for it to exit.
+   */
+  private _killBrowser(): Promise<unknown> {
     this._launch?.abort();
     const browser = this.client.pupBrowser?.process?.();
-    if (!browser?.pid || browser.exitCode !== null || browser.signalCode !== null) return;
-    const exited = once(browser, "exit");
+    if (!browser?.pid || browser.exitCode !== null || browser.signalCode !== null) {
+      return Promise.resolve();
+    }
+    // The next browser cannot open the profile until this one is gone.
+    const exited = new Promise((resolve) => {
+      browser.once("exit", resolve);
+      setTimeout(resolve, KILL_WAIT_MS).unref?.();
+    });
     try {
       process.kill(process.platform === "win32" ? browser.pid : -browser.pid, "SIGKILL");
     } catch {
       browser.kill("SIGKILL");
     }
-    // The next browser cannot open the profile until this one is gone.
-    await Promise.race([
-      exited,
-      new Promise((resolve) => setTimeout(resolve, KILL_WAIT_MS).unref?.()),
-    ]);
+    return exited;
   }
 
   private _listen(): void {
@@ -963,9 +1008,11 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     on("ready", () => this._onReady());
     on("disconnected", (reason) => this._onDisconnected(String(reason)));
     on("message_create", (message) => this._guard("message", this._onMessage(message)));
-    on("message_edit", (message, _new, previous) => this._onEdit(message, String(previous)));
+    on("message_edit", (message, _new, previous) =>
+      this._guard("edit", this._onEdit(message, String(previous))),
+    );
     on("message_revoke_everyone", (message, revoked) => this._onRevoke(message, revoked));
-    on("message_reaction", (reaction) => this._onReaction(reaction));
+    on("message_reaction", (reaction) => this._guard("reaction", this._onReaction(reaction)));
     on("message_ack", (message, ack) => this._onAck(message, ack));
     on("vote_update", (vote) => this._guard("poll vote", this._onVote(vote)));
     on("call", (call) => void this._dispatch(this._callHandlers, call, "onCall"));
@@ -987,7 +1034,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     }
     this._logger.info("WhatsApp session ready", { userId: this.botUserId });
     void this._learnLid();
-    this._guard("catch-up", this._catchUp());
+    this._catchUpNext();
   }
 
   private async _onMessage(raw: WAMessage): Promise<void> {
@@ -996,8 +1043,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     if (raw.isStatus || isBroadcastId(chatId) || SYSTEM_TYPES.has(raw.type)) return;
     const id = serialize(raw.id);
     if (this._recent.has(id)) return;
-    this._recent.add(id);
-    if (this._recent.size > MAX_RECENT) this._recent.delete(this._recent.values().next().value!);
+    addRecent(this._recent, id);
 
     const threadId = this.encodeThreadId({ chatId });
     if (this._config.markSeen && !raw.fromMe) {
@@ -1005,14 +1051,21 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
         this._logger.warn("Failed to send a read receipt", { error, threadId }),
       );
     }
-    const author = this._author(raw);
-    if ((await this._answer(raw, threadId, author)) || this._command(raw, threadId, author)) {
+    // What the operator sends from the phone is a person's; only an echo of the adapter's own send is its own.
+    const isMe = raw.fromMe && (this._forwarded(raw) || (await this._echo(id)));
+    const author = this._author(raw, isMe);
+    // Its own echo never answers a modal or runs a command, which could answer itself in turn.
+    if (
+      !author.isMe &&
+      ((await this._answer(raw, threadId, author)) || this._command(raw, threadId, author))
+    ) {
       await this._remember(raw);
       return;
     }
-    const parsed = this._addons("onMessage").length > 0 ? await this._parse(raw) : undefined;
+    const parsed =
+      this._addons("onMessage").length > 0 ? await this._parse(raw, author) : undefined;
     if (!parsed || !(await this._claimed(parsed, threadId))) {
-      await this._chat.processMessage(this, threadId, parsed ?? (() => this._parse(raw)));
+      await this._chat.processMessage(this, threadId, parsed ?? (() => this._parse(raw, author)));
     }
     await this._remember(raw);
   }
@@ -1170,14 +1223,18 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     return `wwebjs:${this.name}:seen`;
   }
 
-  /** Writes run in turn, so an older position never lands after a newer one. */
+  /** Writes run in turn, so an older position never lands after a newer one; one that fails is written again by the watchdog. */
   private _save(): Promise<unknown> {
     const state = this._chat?.getState();
     if (!state) return Promise.resolve();
     this._saving = this._saving
       .then(() => state.set(this._seenKey(), this._seen))
-      .catch((error: unknown) =>
-        this._logger.warn("Could not record the last message delivered", { error }),
+      .then(
+        () => (this._unsaved = false),
+        (error: unknown) => {
+          this._unsaved = true;
+          this._logger.warn("Could not record the last message delivered", { error });
+        },
       );
     return this._saving;
   }
@@ -1195,8 +1252,26 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     const at = Math.min(raw.timestamp, Math.floor(Date.now() / 1000) + CLOCK_SKEW_S);
     const { ids } = this._seen;
     if (at < this._seen.at || (at === this._seen.at && ids.includes(id))) return false;
-    this._seen = { at, ids: at === this._seen.at ? [...ids, id] : [id], wid: this.botUserId };
+    this._seen = this._position(at, at === this._seen.at ? [...ids, id] : [id]);
     return true;
+  }
+
+  private _position(at: number, ids: string[]): Seen {
+    return { at, ids, own: this._config.receiveOwnMessages || undefined, wid: this.botUserId };
+  }
+
+  /** One that fails, reading its position or the chats, is owed, and the watchdog runs it again. */
+  private _catchUpNext(): void {
+    this._owed = false;
+    this._catching = this._catching
+      .then(() => this._catchUp())
+      .then(
+        () => (this._owed = false),
+        (error: unknown) => {
+          this._owed = true;
+          this._logger.warn("Inbound catch-up was not handled", { error });
+        },
+      );
   }
 
   /** WhatsApp Web loads what arrived while the session was down without announcing every message. */
@@ -1209,7 +1284,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     if (this._seen?.wid && this._seen.wid !== this.botUserId) this._seen = null;
     const seen = this._seen;
     if (!seen) {
-      this._seen = { at: Math.floor(Date.now() / 1000), ids: [], wid: this.botUserId };
+      this._seen = this._position(Math.floor(Date.now() / 1000), []);
       await this._save();
       return;
     }
@@ -1234,7 +1309,8 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
           });
         const behind = messages.filter(unseen);
         truncated ||= behind.length === MAX_CATCH_UP_MESSAGES;
-        missed.push(...behind);
+        // Past a position recorded without what the adapter sent, the account's messages could be its own, which it must never be handed.
+        missed.push(...behind.filter((message) => seen.own || !message.fromMe));
       }
       if (truncated) {
         this._logger.warn(
@@ -1256,13 +1332,16 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     }
   }
 
-  private _onEdit(raw: WAMessage, previousBody: string): void {
+  /** The account's edit of a message this adapter sent is the adapter's own; any other is the operator's. */
+  private async _onEdit(raw: WAMessage, previousBody: string): Promise<void> {
     if (this._isOwn(raw.fromMe)) return;
+    const author = this._author(raw, raw.fromMe && (await this._echo(serialize(raw.id))));
     this._chat?.processMessageUpdated({
       adapter: this,
-      message: () => this._parse(raw),
+      message: () => this._parse(raw, author),
       previousMessage: async () => {
         const previous = this.parseMessage(raw);
+        previous.author = author;
         previous.text = previousBody;
         previous.formatted = this._converter.toAst(previousBody);
         return previous;
@@ -1285,17 +1364,20 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     });
   }
 
-  private _onReaction(reaction: Reaction): void {
+  /** The account's reaction to a message this adapter reacted to is the adapter's own; any other is the operator's. */
+  private async _onReaction(reaction: Reaction): Promise<void> {
     if (this._isOwn(reaction.id.fromMe)) return;
+    const messageId = serialize(reaction.msgId);
+    const isMe = reaction.id.fromMe && (await this._marked(`reacted:${messageId}`));
     this._chat?.processReaction({
       adapter: this,
       added: reaction.reaction.length > 0,
       emoji: defaultEmojiResolver.fromGChat(reaction.reaction),
-      messageId: serialize(reaction.msgId),
+      messageId,
       raw: reaction,
       rawEmoji: reaction.reaction,
       threadId: this.encodeThreadId({ chatId: serialize(reaction.id.remote) }),
-      user: participantAuthor(serialize(reaction.senderId), reaction.id.fromMe),
+      user: participantAuthor(serialize(reaction.senderId), isMe),
     });
   }
 
@@ -1373,8 +1455,9 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     }
   }
 
-  private async _parse(raw: WAMessage): Promise<Message<WAMessage>> {
+  private async _parse(raw: WAMessage, author: Author): Promise<Message<WAMessage>> {
     const parsed = this.parseMessage(raw);
+    parsed.author = author;
     const bot = this._botUsers();
     const others = [
       ...new Set((raw.mentionedIds ?? []).map(serialize).filter((id) => !bot.has(toUser(id)))),
@@ -1392,12 +1475,14 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     if (raw.hasQuotedMsg) {
       const quoted = await within(raw.getQuotedMessage());
       if (quoted) parsed.replyTo = this.parseMessage(quoted);
-      if (quoted?.fromMe) parsed.isMention = true;
+      // A reply to the account's own message addresses the bot, unless the account wrote it.
+      if (quoted?.fromMe && !raw.fromMe) parsed.isMention = true;
     }
     return parsed;
   }
 
-  private _author(raw: WAMessage): Author {
+  /** The account's own messages come from `botUserId`, whether the adapter sent them or its owner did. */
+  private _author(raw: WAMessage, isMe = raw.fromMe): Author {
     const chatId = chatIdOf(raw);
     const userId = raw.fromMe
       ? (this.botUserId ?? chatId)
@@ -1407,8 +1492,8 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     const pushName = (raw.rawData as { notifyName?: string } | undefined)?.notifyName;
     return {
       fullName: pushName ?? "",
-      isBot: raw.fromMe,
-      isMe: raw.fromMe,
+      isBot: isMe,
+      isMe,
       userId,
       userName: pushName || toUser(userId),
     };
@@ -1518,6 +1603,8 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
       return;
     }
     if (this._state !== "connected") return;
+    if (this._owed) this._catchUpNext();
+    if (this._unsaved) void this._save();
     const state = await within(this.client.getState());
     if (state === "CONNECTED") {
       this._strikes = 0;
@@ -1597,7 +1684,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
 
     let first: WAMessage | undefined;
     for (const [content, sendOptions] of payloads) {
-      const sent = await this.client.sendMessage(
+      const sent = await this._post(
         chatId,
         content,
         first ? { ...sendOptions, quotedMessageId: undefined } : sendOptions,
@@ -1615,7 +1702,61 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     options?: MessageSendOptions,
   ): Promise<RawMessage<WAMessage>> {
     const { chatId } = this.decodeThreadId(threadId);
-    return this._raw(await this.client.sendMessage(chatId, content, options), threadId);
+    return this._raw(await this._post(chatId, content, options), threadId);
+  }
+
+  /** Every send goes through here, under way before it starts, so its echo stays the adapter's own even when it arrives before the id. */
+  private async _post(
+    chatId: string,
+    content: MessageContent,
+    options?: MessageSendOptions,
+  ): Promise<WAMessage | undefined> {
+    if (!this._config.receiveOwnMessages) return this.client.sendMessage(chatId, content, options);
+    let settle!: (value?: unknown) => void;
+    const sending = new Promise((resolve) => (settle = resolve));
+    this._sending.add(sending);
+    try {
+      const sent: WAMessage | undefined = await this.client.sendMessage(chatId, content, options);
+      if (sent) await this._mark(`sent:${serialize(sent.id)}`);
+      return sent;
+    } finally {
+      this._sending.delete(sending);
+      settle();
+    }
+  }
+
+  /** Kept in state too, for as long as a catch-up reaches back, so an echo replayed after a restart is still its own. */
+  private async _mark(key: string): Promise<void> {
+    if (!this._config.receiveOwnMessages) return;
+    addRecent(this._own, key);
+    await this._chat
+      ?.getState()
+      .set(this._ownKey(key), true, this._config.catchUpMs || CATCH_UP_MS)
+      .catch((error: unknown) =>
+        this._logger.warn("Could not record what the adapter did", { error, key }),
+      );
+  }
+
+  private async _marked(key: string): Promise<boolean> {
+    return this._own.has(key) || !!(await this._chat?.getState().get(this._ownKey(key)));
+  }
+
+  private _ownKey(key: string): string {
+    return `wwebjs:${this.name}:${key}`;
+  }
+
+  /** whatsapp-web.js can emit a send's echo before `sendMessage()` returns its id, so the sends under way settle first. */
+  private async _echo(id: string): Promise<boolean> {
+    await Promise.allSettled(this._sending);
+    return this._marked(`sent:${id}`);
+  }
+
+  /** Claimed on arrival, by a forward the adapter made that no echo has claimed yet. */
+  private _forwarded(raw: WAMessage): boolean {
+    if (!raw.isForwarded || this._forwards === 0) return false;
+    this._forwards--;
+    void this._mark(`sent:${serialize(raw.id)}`);
+    return true;
   }
 
   private _raw(sent: WAMessage | undefined, threadId: string): RawMessage<WAMessage> {
@@ -1711,6 +1852,12 @@ function locationText({ address, latitude, longitude, name }: WALocation): strin
   return [name, address, `https://maps.google.com/?q=${latitude},${longitude}`]
     .filter(Boolean)
     .join("\n");
+}
+
+/** Keeps a set to its most recent {@link MAX_RECENT} entries. */
+function addRecent(ids: Set<string>, id: string): void {
+  ids.add(id);
+  if (ids.size > MAX_RECENT) ids.delete(ids.values().next().value!);
 }
 
 function within<T>(lookup: Promise<T>): Promise<T | null> {
