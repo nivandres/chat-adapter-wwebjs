@@ -100,7 +100,14 @@ import type {
   WWebJSSendPollArgs,
   WWebJSThreadId,
 } from "./types.js";
-import { Client as WAClient, Location, Poll, ScheduledEvent } from "./wwebjs.js";
+import {
+  Client as WAClient,
+  Location,
+  outdatedError,
+  Poll,
+  ScheduledEvent,
+  TESTED_WWEBJS,
+} from "./wwebjs.js";
 
 const ACK_STATUSES: Record<number, WWebJSAckStatus> = {
   [-1]: "error",
@@ -881,7 +888,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     } catch (error) {
       // An abandoned attempt keeps its browser otherwise; a superseded one leaves the newer attempt's alone.
       if (this._owned && attempt === this._attempts) await this._close().catch(() => undefined);
-      throw error;
+      throw outdatedError(error) ?? error;
     } finally {
       clearTimeout(timer);
       this.client.off("qr", waiting);
@@ -1763,7 +1770,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     if (!sent) {
       throw new ValidationError(
         "wwebjs",
-        "WhatsApp did not return the sent message. whatsapp-web.js 1.34.7 and older cannot read current WhatsApp Web; install github:pedroslopez/whatsapp-web.js#064a3d5.",
+        `WhatsApp did not return the sent message. whatsapp-web.js 1.34.8 and older cannot read current WhatsApp Web; install ${TESTED_WWEBJS}.`,
       );
     }
     return { id: sent.id._serialized, raw: sent, threadId };

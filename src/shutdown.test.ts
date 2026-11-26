@@ -101,4 +101,27 @@ describe("closeOnSignal", () => {
     second();
     expect(process.listenerCount("SIGTERM")).toBe(0);
   });
+
+  it("keeps listening while sessions close, so a repeated signal cannot end the process half-closed", async () => {
+    const { closeOnSignal } = await import("./shutdown");
+    let finish!: () => void;
+    const close = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          unsubscribe();
+          finish = resolve;
+        }),
+    );
+    const unsubscribe = closeOnSignal(close, vi.fn());
+
+    process.emit("SIGTERM", "SIGTERM");
+    expect(process.listenerCount("SIGTERM")).toBe(1);
+    process.emit("SIGTERM", "SIGTERM");
+    finish();
+
+    await vi.waitFor(() => expect(kill).toHaveBeenCalledWith(process.pid, "SIGTERM"));
+    expect(close).toHaveBeenCalledOnce();
+    expect(kill).toHaveBeenCalledOnce();
+    expect(process.listenerCount("SIGTERM")).toBe(0);
+  });
 });

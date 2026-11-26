@@ -1,6 +1,6 @@
 {
   "name": "chat-adapter-wwebjs",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "WhatsApp adapter for Chat SDK, backed by whatsapp-web.js",
   "author": "nivandres",
   "license": "MIT",
@@ -63,7 +63,7 @@
     "tsup": "^9.0.0",
     "typescript": "^5.7.0",
     "vitest": "^5.1.0",
-    "whatsapp-web.js": "github:pedroslopez/whatsapp-web.js#064a3d5"
+    "whatsapp-web.js": "github:pedroslopez/whatsapp-web.js#38eb45b2759450cc6fccb6a7a3f2cbc3bdb87db2"
   },
   "publishConfig": {
     "access": "public"

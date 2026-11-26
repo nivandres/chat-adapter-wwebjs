@@ -1,5 +1,14 @@
 # chat-adapter-wwebjs
 
+## 0.2.1
+
+### Fixed
+
+- No session could link since WhatsApp Web removed the module whatsapp-web.js waited on, around 2026-11-25: `connect()` failed after 30 seconds with `auth timeout`, with every release up to 1.34.8 and with the commit this adapter pointed to. It is now tested against whatsapp-web.js `38eb45b`, which reads the new one, and the README installs that commit by its full SHA, since npm resolves a short one over SSH and fails without a GitHub SSH key.
+- `connect()` now says what to do when whatsapp-web.js times out this way: the error names the installed version and the commit to install.
+- A second signal while the browser was closing, as Ctrl+C under `npx` or `npm exec` sends, ended the process before the browser closed, leaving Chromium running with the profile locked. Signals are now listened for until every session has closed.
+- The README says how to let npm 11 and bun download Chromium, which they skip until allowed, and how to use a browser you already have.
+
 ## 0.2.0
 
 ### Changed

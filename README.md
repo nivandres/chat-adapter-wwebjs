@@ -22,12 +22,12 @@ Documentation: [chat-sdk.dev/adapters/community/wwebjs](https://chat-sdk.dev/ada
 ## Installation
 
 ```bash
-pnpm add chat-adapter-wwebjs chat @chat-adapter/shared github:pedroslopez/whatsapp-web.js#064a3d5
+pnpm add chat-adapter-wwebjs chat @chat-adapter/shared github:pedroslopez/whatsapp-web.js#38eb45b2759450cc6fccb6a7a3f2cbc3bdb87db2
 ```
 
-ESM only, Node >= 20. `chat`, `@chat-adapter/shared` and `whatsapp-web.js` are peers, so you control their versions. WhatsApp Web renamed the IDs whatsapp-web.js reads, and 1.34.7 cannot send or find chats since, so until a release carries the fix, install the commit this adapter is tested against, as above.
+ESM only, Node >= 20. `chat`, `@chat-adapter/shared` and `whatsapp-web.js` are peers, so you control their versions. WhatsApp Web removed a module whatsapp-web.js waited on, so since 2026-11-25 every release up to 1.34.8 times out before showing a QR. Until a release carries the fix, install the commit this adapter is tested against, as above. Give the full commit SHA: with a short one, npm resolves it over SSH and fails without a GitHub SSH key.
 
-whatsapp-web.js builds when installed from GitHub, and Puppeteer downloads a Chromium build on install. pnpm 10 and later run those scripts only when you allow them, in `pnpm-workspace.yaml`:
+whatsapp-web.js builds when installed from GitHub, and Puppeteer downloads a Chromium build on install. Package managers that run install scripts only when you allow them skip both, and the first start fails with "Could not find Chrome". In pnpm 10 and later, allow them in `pnpm-workspace.yaml`:
 
 ```yaml
 onlyBuiltDependencies:
@@ -35,7 +35,7 @@ onlyBuiltDependencies:
   - puppeteer
 ```
 
-pnpm pins the commit in the lockfile rather than in `package.json`, so commit the lockfile.
+pnpm pins the commit in the lockfile rather than in `package.json`, so commit the lockfile. With npm 11, run `npm approve-scripts puppeteer whatsapp-web.js`; with bun, list both under `trustedDependencies` in `package.json`. Or skip the download: `npx puppeteer browsers install chrome`, or point `PUPPETEER_EXECUTABLE_PATH` or `clientOptions.puppeteer.executablePath` at a Chromium you have.
 
 ## Usage
 
@@ -413,12 +413,13 @@ Examples: `wwebjs:15551234567@c.us` (DM by phone), `wwebjs:99990000111122@lid` (
 
 ### The QR never appears
 
+- `connect()` fails with `auth timeout` or `Waiting failed`: the installed whatsapp-web.js no longer reads current WhatsApp Web. Install the commit in [Installation](#installation); the error names the version you have.
 - Check that Chromium can start: run locally with `clientOptions.puppeteer.headless: false`, or look for missing shared libraries on Linux.
 - WhatsApp replaces the QR every 20 seconds or so; render each one `onQR` receives.
 
 ### Sends fail or chats are not found
 
-- whatsapp-web.js 1.34.7 cannot read current WhatsApp Web. Install `github:pedroslopez/whatsapp-web.js#064a3d5`.
+- whatsapp-web.js 1.34.8 and older cannot read current WhatsApp Web. Install `github:pedroslopez/whatsapp-web.js#38eb45b2759450cc6fccb6a7a3f2cbc3bdb87db2`.
 
 ### "The browser is already running"
 

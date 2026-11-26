@@ -2199,6 +2199,17 @@ describe("WWebJSAdapter", () => {
         expect(adapter.connection).toBe("disconnected");
       });
 
+      it("names the fix when whatsapp-web.js times out on a WhatsApp Web it cannot read", async () => {
+        const { adapter } = await connected(
+          { reconnect: false },
+          { initialize: vi.fn(async () => Promise.reject(new Error("auth timeout"))) },
+        );
+
+        await expect(adapter.connect()).rejects.toThrow(
+          /auth timeout.*whatsapp-web\.js .*install github:pedroslopez\/whatsapp-web\.js#38eb45b/,
+        );
+      });
+
       it("waits as long as it takes for a person to scan the QR", async () => {
         const { adapter, client } = await connected({ connectTimeoutMs: 10_000, reconnect: false });
         const attempt = adapter.connect();
