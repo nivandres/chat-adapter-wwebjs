@@ -1,5 +1,15 @@
 # chat-adapter-wwebjs
 
+## 0.3.0
+
+### Changed
+
+- Needs `chat` and `@chat-adapter/shared` 4.44 or newer, for Chat SDK's bounded parsing below.
+
+### Fixed
+
+- An incoming message that is slow to parse as markdown, such as thousands of `*` or quotes nested hundreds deep, could hold the session for seconds or overflow the stack. Messages are now parsed with Chat SDK's `parseIncoming()`, as its own WhatsApp adapter does, so text over its limits keeps its content in `formatted` as plain text. `text` is unchanged.
+
 ## 0.2.1
 
 ### Fixed

@@ -388,7 +388,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
     return new Message<WAMessage>({
       attachments: toAttachments(raw, this._config.maxMediaBytes),
       author: this._author(raw),
-      formatted: this._converter.toAst(text),
+      formatted: this._converter.parseIncoming(text).formatted,
       id: serialize(raw.id),
       isMention: this._mentionsBot(raw) || undefined,
       links: (raw.links ?? []).map(({ link }) => ({ url: link })),
@@ -1350,7 +1350,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
         const previous = this.parseMessage(raw);
         previous.author = author;
         previous.text = previousBody;
-        previous.formatted = this._converter.toAst(previousBody);
+        previous.formatted = this._converter.parseIncoming(previousBody).formatted;
         return previous;
       },
       threadId: this.encodeThreadId({ chatId: chatIdOf(raw) }),
@@ -1477,7 +1477,7 @@ export class WWebJSAdapter implements Adapter<WWebJSThreadId, WAMessage> {
         if (name) names.set(toUser(id), name);
       }
       parsed.text = this._named(parsed.text, [...names.keys()], (user) => names.get(user)!);
-      parsed.formatted = this._converter.toAst(parsed.text);
+      parsed.formatted = this._converter.parseIncoming(parsed.text).formatted;
     }
     if (raw.hasQuotedMsg) {
       const quoted = await within(raw.getQuotedMessage());

@@ -276,6 +276,18 @@ describe("WWebJSAdapter", () => {
       expect(downloadMedia).not.toHaveBeenCalled();
     });
 
+    it("keeps text that is slow to parse as one plain node, as Chat SDK does", () => {
+      const { adapter } = setup();
+      const body = `${"*a* ".repeat(1100)}end`;
+      const message = adapter.parseMessage(waMessage({ body }));
+
+      expect(message.text).toBe(body);
+      expect(message.formatted).toEqual({
+        type: "root",
+        children: [{ type: "paragraph", children: [{ type: "text", value: body }] }],
+      });
+    });
+
     it("flags a message that mentions the bot by WhatsApp ID", () => {
       const { adapter } = setup();
       expect(adapter.parseMessage(waMessage({ mentionedIds: [BOT] })).isMention).toBe(true);

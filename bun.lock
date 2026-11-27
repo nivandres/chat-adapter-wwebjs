@@ -5,13 +5,13 @@
     "": {
       "name": "chat-adapter-wwebjs",
       "devDependencies": {
-        "@chat-adapter/shared": "^4.44.0",
-        "@chat-adapter/state-memory": "^4.44.0",
-        "@chat-adapter/tests": "^4.44.0",
+        "@chat-adapter/shared": "^4.45.0",
+        "@chat-adapter/state-memory": "^4.45.0",
+        "@chat-adapter/tests": "^4.45.0",
         "@types/node": "^22.0.0",
         "@types/qrcode-terminal": "^0.12.2",
         "@vitest/coverage-v8": "^5.1.0",
-        "chat": "^4.44.0",
+        "chat": "^4.45.0",
         "oxlint": "^1.61.0",
         "prettier": "^3.8.3",
         "qrcode-terminal": "^0.12.0",
@@ -21,8 +21,8 @@
         "whatsapp-web.js": "github:pedroslopez/whatsapp-web.js#38eb45b2759450cc6fccb6a7a3f2cbc3bdb87db2",
       },
       "peerDependencies": {
-        "@chat-adapter/shared": "^4.40.0",
-        "chat": "^4.40.0",
+        "@chat-adapter/shared": "^4.44.0",
+        "chat": "^4.44.0",
         "whatsapp-web.js": "^1.34.7",
       },
     },
@@ -40,13 +40,13 @@
 
     "@bcoe/v8-coverage": ["@bcoe/v8-coverage@1.0.2", "", {}, "sha512-6zABk/ECA/QYSCQ1NGiVwwbQerUCZ+TQbp64Q3AgmfNvurHH0j8TtXa1qbShXA6qqkpAj4V5W8pP6mLe1mcMqA=="],
 
-    "@chat-adapter/catalog": ["@chat-adapter/catalog@4.44.0", "", {}, "sha512-UtpW5mMgIjYBRDIgxJKh+tfnlFe0GjLsFG5MPPUDA5b/PggSOAt00TFr0xF6UIXXh1SaK3V1u3FiXyM2sdnaJQ=="],
+    "@chat-adapter/catalog": ["@chat-adapter/catalog@4.45.0", "", {}, "sha512-oP8ySvXTYRVRIusTehLTvpwynMLkEcaFZBASZRDDfNFZzSO02xQX1kVgMAz4VbtiMTMU6k01tjZE4KEDbrmonA=="],
 
-    "@chat-adapter/shared": ["@chat-adapter/shared@4.44.0", "", { "dependencies": { "chat": "4.44.0" } }, "sha512-g6MmtkFLVE3Fn19Ly8e+3bZTAw5Kzh/2oP3qKRaVW0IPwVLDa2GRq/Q5fpGS+Xmzn2oqzpaHJrRuQRdWjLboqg=="],
+    "@chat-adapter/shared": ["@chat-adapter/shared@4.45.0", "", { "dependencies": { "chat": "4.45.0" } }, "sha512-q2V7uNMqIcT1OE6E0ckz9QLtHj2rCyn/XA9apNz0u0XP5Iex7KQBqnXytUyCLEncHD4R9tNTES6AWfjpRESrKQ=="],
 
-    "@chat-adapter/state-memory": ["@chat-adapter/state-memory@4.44.0", "", { "dependencies": { "chat": "4.44.0" } }, "sha512-Z1grqxdp+jYQffWZQJaJ2e2N9zxuX3GbX67D9Xrl7c3xZCi/9Ltvcb0ufvv0UnmgMnGWYFCC8kGATpwcWtmKvg=="],
+    "@chat-adapter/state-memory": ["@chat-adapter/state-memory@4.45.0", "", { "dependencies": { "chat": "4.45.0" } }, "sha512-50wq0veX52i5ayyz01coPJI/XRNt/DlncGUFB0MEFqtJVg4qSRLM/W7lCKDj9TCvJeUvyLgkF4yLmmaNEuUB/w=="],
 
-    "@chat-adapter/tests": ["@chat-adapter/tests@4.44.0", "", { "peerDependencies": { "chat": "^4.28.1", "vitest": "^5.0.0" } }, "sha512-Opsc7sPVSSXhPJoi3An/BnyNo9+hR08x8Ga5QN0JVlk9+sDAUWJv7OvVzm0Fe9oUH5gLt3xz4ovmLYpOnOU5Rg=="],
+    "@chat-adapter/tests": ["@chat-adapter/tests@4.45.0", "", { "peerDependencies": { "chat": "^4.28.1", "vitest": "^5.0.0" } }, "sha512-qo6zGNCzwfimum4oykDdYJ0g9oa50ZabIOaeBQe2ZyoBNPpshf/oIh2vlVofyV7lYvUpa2wSu7wgLgoloWSHSQ=="],
 
     "@esbuild/aix-ppc64": ["@esbuild/aix-ppc64@0.28.2", "", { "os": "aix", "cpu": "ppc64" }, "sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ=="],
 
@@ -340,7 +340,7 @@
 
     "character-entities": ["character-entities@2.0.2", "", {}, "sha512-shx7oQ0Awen/BRIdkjkvz54PnEEI/EjwXDSIZp86/KKdbafHh1Df/RYGBhn4hbe2+uKC9FnT5UCEdyPz3ai9hQ=="],
 
-    "chat": ["chat@4.44.0", "", { "dependencies": { "@chat-adapter/catalog": "4.44.0", "@workflow/serde": "4.1.0-beta.2", "mdast-util-to-string": "^4.0.0", "remark-gfm": "^4.0.0", "remark-parse": "^11.0.0", "remark-stringify": "^11.0.0", "remend": "^1.2.1", "unified": "^11.0.5" }, "peerDependencies": { "ai": "^6.0.182 || ^7.0.0", "workflow": "^5.0.0-beta.35", "zod": "^3.0.0 || ^4.0.0" }, "optionalPeers": ["ai", "workflow", "zod"] }, "sha512-DGVc9yV1ifOJFpe8Pz6BAoOBVT7/iI/7kkMuB+ZUrpyQ1iw1ElibxyvYBx7tEo1qPl6w510+Acvt1XSVPSgKjA=="],
+    "chat": ["chat@4.45.0", "", { "dependencies": { "@chat-adapter/catalog": "4.45.0", "@workflow/serde": "4.1.0-beta.2", "mdast-util-to-string": "^4.0.0", "remark-gfm": "^4.0.0", "remark-parse": "^11.0.0", "remark-stringify": "^11.0.0", "remend": "^1.2.1", "unified": "^11.0.5" }, "peerDependencies": { "ai": "^6.0.182 || ^7.0.0", "workflow": "^5.0.0-beta.35", "zod": "^3.0.0 || ^4.0.0" }, "optionalPeers": ["ai", "workflow", "zod"] }, "sha512-7p1fkEupHEqYhXmSxLnHcK4hWEg93182/F2YxHSwqc7xtF4mekmG9EuJjRYX3aNEJJa2Rvu48A1f3ulOxxHIrA=="],
 
     "chokidar": ["chokidar@5.0.0", "", { "dependencies": { "readdirp": "^5.0.0" } }, "sha512-TQMmc3w+5AxjpL8iIiwebF73dRDF4fBIieAqGn9RGCWaEVwQ6Fb2cGe31Yns0RRIzii5goJ1Y7xbMwo1TxMplw=="],
 
